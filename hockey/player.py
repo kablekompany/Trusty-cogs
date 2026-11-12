@@ -1,21 +1,26 @@
 from __future__ import annotations
-import json
-import logging
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Literal, Optional, Union
+
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from typing import TYPE_CHECKING, Dict, List, Literal, NamedTuple, Optional, Union
 
 import aiohttp
 import discord
+from red_commons.logging import getLogger
 from redbot.core.i18n import Translator
 from redbot.core.utils.chat_formatting import box
 from tabulate import tabulate
+from yarl import URL
 
-from .constants import BASE_URL, HEADSHOT_URL, TEAMS
+from .constants import HEADSHOT_URL, TEAMS
+from .helper import Team
+
+if TYPE_CHECKING:
+    from .api import NewAPI
 
 _ = Translator("Hockey", __file__)
 
-log = logging.getLogger("red.trusty-cogs.hockey")
+log = getLogger("red.trusty-cogs.hockey")
 
 
 # This is somewhat unnecessary but for consistency we have the expected
@@ -79,138 +84,648 @@ GOALIE_STATS = {
 }
 
 FLAG_LOOKUP = {
-    "CAN": ":flag_ca:",
-    "USA": ":flag_us:",
-    "SWE": ":flag_se:",
-    "GBR": ":flag_gb:",
-    "CZE": ":flag_cz:",
-    "LVA": ":flag_lv:",
-    "NLD": ":flag_nl:",
-    "FIN": ":flag_fi:",
-    "UKR": ":flag_ua:",
-    "SRB": ":flag_rs:",
-    "FRA": ":flag_fr:",
-    "ITA": ":flag_it:",
-    "VEN": ":flag_si:",
-    "SVK": ":flag_sk:",
-    "IRL": ":flag_ie:",
-    "RUS": ":flag_ru:",
-    "POL": ":flag_pl:",
-    "LBN": ":flag_lb:",
-    "DEU": ":flag_de:",
-    "BRA": ":flag_gi:",
-    "CHE": ":flag_ch:",
-    "DNK": ":flag_dk:",
-    "ZAF": ":flag_za:",
-    "TWN": ":flag_tw:",
-    "JAM": ":flag_jm:",
-    "KOR": ":flag_kr:",
-    "PRY": ":flag_py:",
-    "NOR": ":flag_no:",
-    "HTI": ":flag_ht:",
-    "MKD": ":flag_mk:",
-    "GUY": ":flag_gy:",
-    "HUN": ":flag_hu:",
-    "AUS": ":flag_au:",
-    "AUT": ":flag_at:",
-    "BLR": ":flag_by:",
-    "GRC": ":flag_gr:",
-    "LTU": ":flag_lt:",
-    "BHS": ":flag_bs:",
-    "JPN": ":flag_jp:",
-    "KAZ": ":flag_kz:",
-    "NGA": ":flag_ng:",
-    "EST": ":flag_ee:",
-    "BEL": ":flag_be:",
-    "BRN": ":flag_bn:",
-    "TZA": ":flag_tz:",
-    "SVN": ":flag_si:",
-    "HRV": ":flag_hr:",
-    "ROU": ":flag_ro:",
-    "THA": ":flag_th:",
-    "IDN": ":flag_id:",
-    "MNE": ":flag_me:",
-    "CHN": ":flag_cn:",
-    "BGR": ":flag_bg:",
-    "MEX": ":flag_mx:",
-    "ISR": ":flag_il:",
+    "CAN": "\N{REGIONAL INDICATOR SYMBOL LETTER C}\N{REGIONAL INDICATOR SYMBOL LETTER A}",
+    "USA": "\N{REGIONAL INDICATOR SYMBOL LETTER U}\N{REGIONAL INDICATOR SYMBOL LETTER S}",
+    "SWE": "\N{REGIONAL INDICATOR SYMBOL LETTER S}\N{REGIONAL INDICATOR SYMBOL LETTER E}",
+    "GBR": "\N{REGIONAL INDICATOR SYMBOL LETTER G}\N{REGIONAL INDICATOR SYMBOL LETTER B}",
+    "CZE": "\N{REGIONAL INDICATOR SYMBOL LETTER C}\N{REGIONAL INDICATOR SYMBOL LETTER Z}",
+    "LVA": "\N{REGIONAL INDICATOR SYMBOL LETTER L}\N{REGIONAL INDICATOR SYMBOL LETTER V}",
+    "NLD": "\N{REGIONAL INDICATOR SYMBOL LETTER N}\N{REGIONAL INDICATOR SYMBOL LETTER L}",
+    "FIN": "\N{REGIONAL INDICATOR SYMBOL LETTER F}\N{REGIONAL INDICATOR SYMBOL LETTER I}",
+    "UKR": "\N{REGIONAL INDICATOR SYMBOL LETTER U}\N{REGIONAL INDICATOR SYMBOL LETTER A}",
+    "SRB": "\N{REGIONAL INDICATOR SYMBOL LETTER R}\N{REGIONAL INDICATOR SYMBOL LETTER S}",
+    "FRA": "\N{REGIONAL INDICATOR SYMBOL LETTER F}\N{REGIONAL INDICATOR SYMBOL LETTER R}",
+    "ITA": "\N{REGIONAL INDICATOR SYMBOL LETTER I}\N{REGIONAL INDICATOR SYMBOL LETTER T}",
+    "VEN": "\N{REGIONAL INDICATOR SYMBOL LETTER S}\N{REGIONAL INDICATOR SYMBOL LETTER I}",
+    "SVK": "\N{REGIONAL INDICATOR SYMBOL LETTER S}\N{REGIONAL INDICATOR SYMBOL LETTER K}",
+    "IRL": "\N{REGIONAL INDICATOR SYMBOL LETTER I}\N{REGIONAL INDICATOR SYMBOL LETTER E}",
+    "RUS": "\N{REGIONAL INDICATOR SYMBOL LETTER R}\N{REGIONAL INDICATOR SYMBOL LETTER U}",
+    "POL": "\N{REGIONAL INDICATOR SYMBOL LETTER P}\N{REGIONAL INDICATOR SYMBOL LETTER L}",
+    "LBN": "\N{REGIONAL INDICATOR SYMBOL LETTER L}\N{REGIONAL INDICATOR SYMBOL LETTER B}",
+    "DEU": "\N{REGIONAL INDICATOR SYMBOL LETTER D}\N{REGIONAL INDICATOR SYMBOL LETTER E}",
+    "GER": "\N{REGIONAL INDICATOR SYMBOL LETTER D}\N{REGIONAL INDICATOR SYMBOL LETTER E}",
+    "BRA": "\N{REGIONAL INDICATOR SYMBOL LETTER G}\N{REGIONAL INDICATOR SYMBOL LETTER I}",
+    "CHE": "\N{REGIONAL INDICATOR SYMBOL LETTER C}\N{REGIONAL INDICATOR SYMBOL LETTER H}",
+    "DNK": "\N{REGIONAL INDICATOR SYMBOL LETTER D}\N{REGIONAL INDICATOR SYMBOL LETTER K}",
+    "ZAF": "\N{REGIONAL INDICATOR SYMBOL LETTER Z}\N{REGIONAL INDICATOR SYMBOL LETTER A}",
+    "TWN": "\N{REGIONAL INDICATOR SYMBOL LETTER T}\N{REGIONAL INDICATOR SYMBOL LETTER W}",
+    "JAM": "\N{REGIONAL INDICATOR SYMBOL LETTER J}\N{REGIONAL INDICATOR SYMBOL LETTER M}",
+    "KOR": "\N{REGIONAL INDICATOR SYMBOL LETTER K}\N{REGIONAL INDICATOR SYMBOL LETTER R}",
+    "PRY": "\N{REGIONAL INDICATOR SYMBOL LETTER P}\N{REGIONAL INDICATOR SYMBOL LETTER Y}",
+    "NOR": "\N{REGIONAL INDICATOR SYMBOL LETTER N}\N{REGIONAL INDICATOR SYMBOL LETTER O}",
+    "HTI": "\N{REGIONAL INDICATOR SYMBOL LETTER H}\N{REGIONAL INDICATOR SYMBOL LETTER T}",
+    "MKD": "\N{REGIONAL INDICATOR SYMBOL LETTER M}\N{REGIONAL INDICATOR SYMBOL LETTER K}",
+    "GUY": "\N{REGIONAL INDICATOR SYMBOL LETTER G}\N{REGIONAL INDICATOR SYMBOL LETTER Y}",
+    "HUN": "\N{REGIONAL INDICATOR SYMBOL LETTER H}\N{REGIONAL INDICATOR SYMBOL LETTER U}",
+    "AUS": "\N{REGIONAL INDICATOR SYMBOL LETTER A}\N{REGIONAL INDICATOR SYMBOL LETTER U}",
+    "AUT": "\N{REGIONAL INDICATOR SYMBOL LETTER A}\N{REGIONAL INDICATOR SYMBOL LETTER T}",
+    "BLR": "\N{REGIONAL INDICATOR SYMBOL LETTER B}\N{REGIONAL INDICATOR SYMBOL LETTER Y}",
+    "GRC": "\N{REGIONAL INDICATOR SYMBOL LETTER G}\N{REGIONAL INDICATOR SYMBOL LETTER R}",
+    "LTU": "\N{REGIONAL INDICATOR SYMBOL LETTER L}\N{REGIONAL INDICATOR SYMBOL LETTER T}",
+    "BHS": "\N{REGIONAL INDICATOR SYMBOL LETTER B}\N{REGIONAL INDICATOR SYMBOL LETTER S}",
+    "JPN": "\N{REGIONAL INDICATOR SYMBOL LETTER J}\N{REGIONAL INDICATOR SYMBOL LETTER P}",
+    "KAZ": "\N{REGIONAL INDICATOR SYMBOL LETTER K}\N{REGIONAL INDICATOR SYMBOL LETTER Z}",
+    "NGA": "\N{REGIONAL INDICATOR SYMBOL LETTER N}\N{REGIONAL INDICATOR SYMBOL LETTER G}",
+    "EST": "\N{REGIONAL INDICATOR SYMBOL LETTER E}\N{REGIONAL INDICATOR SYMBOL LETTER E}",
+    "BEL": "\N{REGIONAL INDICATOR SYMBOL LETTER B}\N{REGIONAL INDICATOR SYMBOL LETTER E}",
+    "BRN": "\N{REGIONAL INDICATOR SYMBOL LETTER B}\N{REGIONAL INDICATOR SYMBOL LETTER N}",
+    "TZA": "\N{REGIONAL INDICATOR SYMBOL LETTER T}\N{REGIONAL INDICATOR SYMBOL LETTER Z}",
+    "SVN": "\N{REGIONAL INDICATOR SYMBOL LETTER S}\N{REGIONAL INDICATOR SYMBOL LETTER I}",
+    "HRV": "\N{REGIONAL INDICATOR SYMBOL LETTER H}\N{REGIONAL INDICATOR SYMBOL LETTER R}",
+    "ROU": "\N{REGIONAL INDICATOR SYMBOL LETTER R}\N{REGIONAL INDICATOR SYMBOL LETTER O}",
+    "THA": "\N{REGIONAL INDICATOR SYMBOL LETTER T}\N{REGIONAL INDICATOR SYMBOL LETTER H}",
+    "IDN": "\N{REGIONAL INDICATOR SYMBOL LETTER I}\N{REGIONAL INDICATOR SYMBOL LETTER D}",
+    "MNE": "\N{REGIONAL INDICATOR SYMBOL LETTER M}\N{REGIONAL INDICATOR SYMBOL LETTER E}",
+    "CHN": "\N{REGIONAL INDICATOR SYMBOL LETTER C}\N{REGIONAL INDICATOR SYMBOL LETTER N}",
+    "BGR": "\N{REGIONAL INDICATOR SYMBOL LETTER B}\N{REGIONAL INDICATOR SYMBOL LETTER G}",
+    "MEX": "\N{REGIONAL INDICATOR SYMBOL LETTER M}\N{REGIONAL INDICATOR SYMBOL LETTER X}",
+    "ISR": "\N{REGIONAL INDICATOR SYMBOL LETTER I}\N{REGIONAL INDICATOR SYMBOL LETTER L}",
     None: "",
 }
 
 
-@dataclass
-class Player:
+class SearchPlayer(NamedTuple):
+    playerId: str
+    name: str
+    positionCode: str
+    active: bool
+    birthCity: str
+    birthCountry: str
+    height: str = ""
+    heightInCentimeters: Optional[int] = None
+    heightInInches: Optional[int] = None
+    weightInPounds: Optional[int] = None
+    weightInKilograms: Optional[int] = None
+    birthStateProvince: Optional[str] = None
+    teamId: Optional[str] = None
+    teamAbbrev: Optional[str] = None
+    lastTeamId: Optional[str] = None
+    lastTeamAbbrev: Optional[str] = None
+    lastSeasonId: Optional[str] = None
+    sweaterNumber: Optional[int] = None
+
+    @property
+    def id(self) -> int:
+        return int(self.playerId)
+
+    @property
+    def url(self) -> URL:
+        name = self.name.replace(" ", "-").lower()
+        return URL("https://www.nhl.com/player/").join(URL(f"{name}-{self.id}"))
+
+    @classmethod
+    def from_json(cls, data: dict) -> SearchPlayer:
+        return cls(**data)
+
+
+class RosterPlayer(NamedTuple):
     id: int
-    accrued_seasons: Optional[int]
-    add_names: Optional[str]
-    age_signed_waiver: Optional[int]
-    age_signel_fa: Optional[int]
-    alert: Literal["Y", "N"]
+    headshot: str
+    firstName: dict
+    lastName: dict
+    positionCode: str
+    shootsCatches: str
+    heightInInches: int
+    weightInPounds: int
+    heightInCentimeters: int
+    weightInKilograms: int
+    birthDate: str
+    birthCity: dict
+    birthCountry: str
+    sweaterNumber: Optional[int] = None
+    birthStateProvince: dict = {}
+
+    @property
+    def playerId(self) -> int:
+        return self.id
+
+    # why they alternate the data between id and playerId I don't know
+
+    @property
+    def first_name(self) -> str:
+        return self.firstName.get("default", "")
+
+    @property
+    def last_name(self) -> str:
+        return self.lastName.get("default", "")
+
+    @property
+    def name(self) -> str:
+        return f"{self.first_name} {self.last_name}"
+
+    @classmethod
+    def from_json(cls, data: dict) -> RosterPlayer:
+        return cls(**data)
+
+
+@dataclass
+class Roster:
+    forwards: Dict[int, RosterPlayer]
+    defensemen: Dict[int, RosterPlayer]
+    goalies: Dict[int, RosterPlayer]
+
+    @property
+    def players(self) -> List[RosterPlayer]:
+        return (
+            [p for p in self.forwards.values()]
+            + [p for p in self.defensemen.values()]
+            + [p for p in self.goalies.values()]
+        )
+
+    @classmethod
+    def from_json(cls, data: dict) -> Roster:
+        forwards = {p["id"]: RosterPlayer.from_json(p) for p in data.get("forwards", [])}
+        defensemen = {p["id"]: RosterPlayer.from_json(p) for p in data.get("defensemen", [])}
+        goalies = {p["id"]: RosterPlayer.from_json(p) for p in data.get("goalies", [])}
+        return cls(forwards=forwards, defensemen=defensemen, goalies=goalies)
+
+
+@dataclass
+class Stats:
+    # All player stats
+    # Shared full data
+    # this data appears in player subseason data and goalie career totals
+    goals: Optional[int] = None
+    assists: Optional[int] = None
+    pim: Optional[int] = None
+    # Skater stats
+    shootingPctg: Optional[float] = None
+    powerPlayGoals: Optional[int] = None
+    powerPlayPoints: Optional[int] = None
+    shorthandedGoals: Optional[int] = None
+    shorthandedPoints: Optional[int] = None
+    shots: Optional[int] = None
+    otGoals: Optional[int] = None
+    gameWinningGoals: Optional[int] = None
+    plusMinus: Optional[int] = None
+    points: Optional[int] = None
+    faceoffWinningPctg: Optional[float] = None
+    avgToi: Optional[str] = None
+    # Goalie stats
+    gamesStarted: Optional[int] = None
+    wins: Optional[int] = None
+    losses: Optional[int] = None
+    ties: Optional[int] = None
+    otLosses: Optional[int] = None
+    shotsAgainst: Optional[int] = None
+    goalsAgainst: Optional[int] = None
+    goalsAgainstAvg: Optional[float] = None
+    savePctg: Optional[float] = None
+    shutouts: Optional[int] = None
+    timeOnIce: Optional[str] = None
+    gamesPlayed: Optional[int] = None
+
+    def to_data(self):
+        keys = {
+            _("GP"): "gamesPlayed",
+            _("Goals"): "goals",
+            _("Assists"): "assists",
+            _("Points"): "points",
+            _("Shots"): "shots",
+            _("OT Goals"): "otGoals",
+            _("PPG"): "powerPlayGoals",
+            _("SHG"): "shorthandedGoals",
+            _("GWG"): "gameWinningGoals",
+            _("Avg. TOI"): "avgToi",
+            _("Hits"): "hits",
+            _("Faceoff %"): "faceoffWinningPctg",
+            _("+/-"): "plusMinus",
+            _("Blocked Shots"): "blocked",
+            _("PIM"): "pim",
+            _("Avg. TOI"): "avgToi",
+            _("SO"): "shutouts",
+            _("Save %"): "savePctg",
+            _("Goals Against"): "goalsAgainst",
+            _("Shots Against"): "shotsAgainst",
+            _("GAA"): "goalsAgainstAvg",
+            _("Started"): "gamesStarted",
+            _("Wins"): "wins",
+            _("Losses"): "losses",
+            _("OT Losses"): "otLosses",
+            _("Shutouts"): "shutouts",
+            _("Time on Ice"): "timeOnIce",
+            # _("Ties"): "ties",
+        }
+        ret = {}
+        for key, value in keys.items():
+            data = getattr(self, value, None)
+            if data is not None:
+                ret[key] = data
+        return ret
+
+
+@dataclass
+class FeaturedStats:
+    season: int
+    regularSeason: Stats
+    career: Stats
+
+    @classmethod
+    def from_json(cls, data: dict) -> FeaturedStats:
+        return cls(
+            season=data.get("season"),
+            regularSeason=Stats(**data.get("regularSeason", {}).get("subSeason")),
+            career=Stats(**data.get("regularSeason", {}).get("career")),
+        )
+
+    def get_str(self):
+        season_str = str(self.season)
+        style = f"{season_str[:4]}-{season_str[4:]}"
+        post_data = []
+        season_data = self.regularSeason.to_data()
+        career_data = self.career.to_data()
+        for key, season_value in season_data.items():
+            career_value = career_data.get(key, None)
+            if season_value and career_value:
+                if isinstance(career_value, float):
+                    post_data.append([key, f"{career_value:.3f}", f"{season_value:.3f}"])
+                else:
+                    post_data.append([key, f"{career_value}", f"{season_value}"])
+        return tabulate(
+            post_data,
+            headers=[_("Stats"), _("Career"), style],
+            stralign="left",
+            disable_numparse=True,
+        )
+
+
+@dataclass
+class CareerStats:
+    regularSeason: Stats
+    playoffs: Stats
+
+    @classmethod
+    def from_json(cls, data: dict) -> CareerStats:
+        return cls(
+            regularSeason=Stats(**data.get("regularSeason", {})),
+            playoffs=Stats(**data.get("playoffs", {})),
+        )
+
+
+@dataclass
+class SeasonStats(Stats):
+    season: Optional[int] = None
+    gameTypeId: Optional[int] = None
+    leagueAbbrev: Optional[str] = None
+    teamName: Optional[dict] = field(default_factory=dict)
+    sequence: Optional[int] = None
+    teamCommonName: Optional[dict] = field(default_factory=dict)
+    teamPlaceNameWithPreposition: Optional[dict] = field(default_factory=dict)
+
+    def get_str(self):
+        season_str = str(self.season)
+        style = f"{season_str[:4]}-{season_str[4:]}"
+        post_data = []
+        keys = self.to_data()
+        for key, season_value in keys.items():
+            # season_value = getattr(self, value, None)
+            if season_value is not None:
+                post_data.append([key, f"{season_value}"])
+        return tabulate(post_data, headers=[_("Stats"), style])
+
+
+@dataclass
+class PlayerStats:
+    playerId: int
+    isActive: bool
+    firstName: dict
+    lastName: dict
+    position: Optional[str]
+    headshot: Optional[str]
+    heroImage: Optional[str]
+    birthDate: str
+    birthCity: dict
+    birthCountry: str
+    draftDetails: dict
+    playerSlug: str
+    inTop100AllTime: int
+    inHHOF: int
+    featuredStats: Optional[FeaturedStats]
+    careerTotals: Optional[CareerStats]
+    shopLink: str
+    twitterLink: str
+    watchLink: str
+    last5Games: List[dict]
+    seasonTotals: List[SeasonStats]
+    awards: List[dict]
+    _api: NewAPI
+    currentTeamRoster: List[dict]
+    heightInInches: Optional[int] = None
+    heightInCentimeters: Optional[int] = None
+    weightInPounds: Optional[int] = None
+    weightInKilograms: Optional[int] = None
+    currentTeamId: Optional[int] = None
+    currentTeamAbbrev: Optional[str] = None
+    birthStateProvince: dict = field(default_factory=dict)
+    fullTeamName: dict = field(default_factory=dict)
+    teamLogo: Optional[str] = None
+    sweaterNumber: Optional[int] = None
+    shootsCatches: Optional[str] = None
+    teamCommonName: Optional[dict] = field(default_factory=dict)
+    teamPlaceNameWithPreposition: Optional[dict] = field(default_factory=dict)
+
+    @classmethod
+    def from_json(cls, data: dict, api: NewAPI) -> PlayerStats:
+        featured_stats = data.pop("featuredStats", None)
+        featured = None
+        if featured_stats:
+            featured = FeaturedStats.from_json(featured_stats)
+        career = None
+        career_stats = data.pop("careerTotals", None)
+        if career_stats:
+            career = CareerStats.from_json(career_stats)
+        awards = data.pop("awards", [])
+        seasons = [SeasonStats(**i) for i in data.pop("seasonTotals", [])]
+        last5 = data.pop("last5Games", [])
+        current_team = data.pop("currentTeamRoster", [])
+        draft = data.pop("draftDetails", {})
+        to_rem = []
+        for key in data.keys():
+            if key not in cls.__dataclass_fields__:
+                to_rem.append(key)
+        for key in to_rem:
+            data.pop(key)
+        return cls(
+            draftDetails=draft,
+            featuredStats=featured,
+            careerTotals=career,
+            seasonTotals=seasons,
+            awards=awards,
+            last5Games=last5,
+            currentTeamRoster=current_team,
+            _api=api,
+            **data,
+        )
+
+    @property
+    def id(self) -> int:
+        return self.playerId
+
+    @property
+    def first_name(self) -> str:
+        return self.firstName.get("default", "")
+
+    @property
+    def last_name(self) -> str:
+        return self.lastName.get("default", "")
+
+    @property
+    def full_name(self) -> str:
+        return f"{self.first_name} {self.last_name}"
+
+    @property
+    def full_name_url(self) -> URL:
+        return URL(self.full_name.replace(" ", "-"))
+
+    @property
+    def sweater_number(self) -> Optional[int]:
+        return self.sweaterNumber
+
+    @property
+    def birth_date(self) -> date:
+        return date.fromisoformat(self.birthDate)
+
+    @property
+    def birth_country(self) -> str:
+        return self.birthCountry
+
+    @property
+    def birth_city(self) -> str:
+        return self.birthCity.get("default", "")
+
+    @property
+    def birth_state_province(self) -> str:
+        return self.birthStateProvince.get("default", "")
+
+    @property
+    def nationality(self) -> str:
+        return self.birthCountry
+
+    @property
+    def height(self) -> int:
+        return self.heightInInches
+
+    @property
+    def weight(self) -> int:
+        return self.weightInPounds
+
+    @property
+    def shoots_catches(self) -> str:
+        return self.shootsCatches
+
+    @property
+    def ep_url(self) -> URL:
+        return URL("https://www.eliteprospects.com/player/").join(
+            URL(f"{self.id}/{self.full_name_url}")
+        )
+
+    @property
+    def cap_friendly_url(self) -> URL:
+        return URL("https://www.capfriendly.com/players/").join(self.full_name_url)
+
+    @property
+    def puckpedia_url(self) -> URL:
+        return URL("https://puckpedia.com/player/").join(self.full_name_url)
+
+    @property
+    def the_stanley_cap_url(self) -> URL:
+        return URL("https://thestanleycap.com/players/").joinpath(
+            f"{self.full_name_url}-{self.id}"
+        )
+
+    @property
+    def capwages_url(self) -> URL:
+        return URL("https://capwages.com/players/").joinpath(f"{self.full_name_url}".lower())
+
+    @property
+    def url(self) -> URL:
+        return URL("https://www.nhl.com/player/").joinpath(f"{self.full_name_url}-{self.id}")
+
+    @property
+    def hockey_reference_url(self) -> URL:
+        return URL("https://www.hockey-reference.com/search/search.fcgi").with_query(
+            search=str(self.full_name_url)
+        )
+        # "?hint=&search={self.full_name_url}"
+
+    def __str__(self) -> str:
+        return f"{self.full_name}, born {self.birth_date}"
+
+    def __repr__(self) -> str:
+        return f"<Player name={self.full_name} id={self.id} number={self.sweater_number}>"
+
+    def description(self) -> str:
+        desc = {
+            "birth_date": _("Born: "),
+            # "birth_city": _("Hometown: "),
+            "position": _("Position: "),
+            "height": _("Height: "),
+            "weight": _("Weight: "),
+            "is_rookie": _("Rookie"),
+            "is_junior": _("Junior"),
+            "is_suspended": _("Suspended"),
+        }
+
+        msg = ""
+        for attr, name in desc.items():
+            if getattr(self, attr, None):
+                if attr == "height" and self.height:
+                    msg += (
+                        name
+                        + f"{self.height // 12}' {self.height % 12}\" / {int(self.height * 2.54)} cm\n"
+                    )
+                elif attr == "birth_date" and self.birth_date is not None:
+                    years = int(
+                        (datetime.now() - datetime.strptime(str(self.birth_date), "%Y-%m-%d")).days
+                        / 365.25
+                    )
+                    msg += name + f"{getattr(self, attr)} ({years})\n"
+                    flag = FLAG_LOOKUP.get(self.birth_country, "")
+                    birth_loc_order = [
+                        self.birth_city,
+                        self.birth_state_province,
+                    ]
+                    for loc in birth_loc_order:
+                        if not loc:
+                            continue
+                        msg += f"{loc}, "
+                    msg += f"{self.birth_country} {flag}\n"
+
+                elif attr == "weight" and self.weight:
+                    msg += name + f"{self.weight} lbs / {int(self.weight * 0.453592)} kg\n"
+                elif attr == "home_town":
+                    flag = FLAG_LOOKUP.get(self.nationality, "")
+                    msg += name + f"{getattr(self, attr)} {flag}\n"
+                elif attr == "position":
+                    shoots = f"({getattr(self, 'shoots_catches', '')})"
+                    ir = (
+                        "\N{ADHESIVE BANDAGE}"
+                        if getattr(self, "long_term_injury", "N") == "Y"
+                        else ""
+                    )
+                    msg += name + f"{getattr(self, attr)} {shoots if shoots != '()' else ''}{ir}\n"
+                elif attr == "deceased":
+                    death_date = getattr(self, "date_of_death", "")
+                    msg += f"{name} {death_date}\n" if getattr(self, attr) else ""
+                elif attr in ["is_rookie", "is_junior", "is_suspended"]:
+                    if getattr(self, attr, "N") == "Y":
+                        msg += f"{name}\n"
+                elif attr == "dda_id":
+                    msg += name.format(dda_id=self.dda_id) + "\n"
+                else:
+                    msg += name + f"{getattr(self, attr, '')}\n"
+        links = [
+            _("[NHL]({ep_url})").format(ep_url=str(self.url)),
+            # _("[Cap Friendly]({cf_url})").format(cf_url=self.cap_friendly_url),
+            _("[Puckpedia]({cf_url})").format(cf_url=str(self.puckpedia_url)),
+            _("[The Stanley Cap]({cf_url})").format(cf_url=str(self.the_stanley_cap_url)),
+            _("[Capwages]({cf_url})").format(cf_url=str(self.capwages_url)),
+            _("[Hockey Reference]({cf_url})").format(cf_url=str(self.hockey_reference_url)),
+        ]
+        if getattr(self, "dda_id", None):
+            links.append(
+                _(
+                    "[HHOF]( https://www.hhof.com/LegendsOfHockey/jsp/SearchPlayer.jsp?player={dda_id})"
+                ).format(dda_id=self.dda_id)
+            )
+        msg += " | ".join(links)
+        return msg
+
+    def get_team_data(self, *, team_name: Optional[str] = None) -> Team:
+        try:
+            team_id = self.currentTeamId
+            if team_name is None:
+                log.verbose("SimplePlayer team_id: %s", team_id)
+                team_name = [name for name, team in TEAMS.items() if team["id"] == team_id][0]
+            return Team.from_json(TEAMS[team_name], team_name, self._api)
+        except (IndexError, KeyError):
+            return Team.from_json({}, _("Unknown Team"), self._api)
+
+    def get_embed(
+        self, season: Optional[str] = None, include_headshot: Optional[bool] = True
+    ) -> Dict[str, Union[discord.Embed, List[discord.File]]]:
+        team_data = self.get_team_data()
+        em = discord.Embed()
+        em.description = self.description()
+        if include_headshot:
+            em.set_thumbnail(url=self.headshot)
+        number = f"#{self.sweater_number}" if self.sweater_number else ""
+
+        em.description = self.description()
+        if self.heroImage:
+            em.set_image(url=self.heroImage)
+
+        stats_md = None
+        if season is not None and self.seasonTotals is not None:
+            career_stats = {}
+            stats_dict = {}
+            if self.careerTotals is not None:
+                career_stats = self.careerTotals.regularSeason.to_data()
+            for stats in self.seasonTotals:
+                if str(stats.season) == season and stats.gameTypeId == 2:
+                    team_data = self.get_team_data(team_name=stats.teamName.get("default"))
+                    stats_dict = stats.to_data()
+                    break
+            post_data = []
+            style = f"{season[:4]}-{season[4:]}"
+            for key, season_value in stats_dict.items():
+                career_value = career_stats.get(key, "None")
+                if season_value and career_value:
+                    if isinstance(season_value, float):
+                        post_data.append([key, f"{career_value:.2f}", f"{season_value:.2f}"])
+                    else:
+                        post_data.append([key, f"{career_value}", f"{season_value}"])
+            stats_md = tabulate(
+                post_data, headers=[_("Stats"), _("Career"), style], numalign="center"
+            )
+
+        if self.featuredStats and stats_md is None:
+            stats_md = self.featuredStats.get_str()
+
+        if stats_md is not None:
+            stats_str = "{emoji} {team_name} {emoji}\n{stats}".format(
+                emoji=team_data.emoji, team_name=team_data.name, stats=box(stats_md, lang="ansi")
+            )
+            em.add_field(name=_("Stats"), value=stats_str)
+        em.set_author(name=f"{self.full_name} {number}", icon_url=team_data.file_url, url=self.url)
+        ret: Dict[str, Union[discord.Embed, List[discord.File]]] = {"embed": em}
+        if team_data.file:
+            ret["files"] = [team_data.file]
+        return ret
+
+
+################################################################################################
+#                                         Old API data
+################################################################################################
+
+
+@dataclass
+class SimplePlayer:
+    id: int
+    full_name: str
+    birth_date: Optional[str]
+    home_town: Optional[str]
+    position: Optional[Literal["L", "R", "C", "D", "G"]]
+    height: Optional[int]
+    weight: Optional[int]
     birth_city: Optional[str]
     birth_country: Optional[str]
-    birth_date: Optional[str]
     birth_state_province: Optional[str]
-    career_team_id: Optional[int]
-    central_registry_position: Optional[str]
-    club_elect_arb: Literal["Y", "N"]
-    current_team_id: Optional[int]
-    date_of_death: Optional[str]
-    dda_id: Optional[int]
-    deceased: bool
-    ep_player_id: Optional[int]
-    fa_group_after_season: Literal[None]
-    first_name: str
-    first_signed_by_team_id: Optional[int]
-    free_agent_group: Optional[str]
-    full_name: str
-    group_5_election: Literal["Y", "N"]
-    group_5_seasons_earned: Optional[int]
-    group_6_proration: Literal[None]
-    group_6_seasons_earned: Optional[int]
-    groups_earned_thru_season: Optional[int]
-    height: Optional[int]
-    hof_induction_year: Optional[int]
-    home_town: Optional[str]
-    iihf_hof_induction_year: Optional[int]
-    in_hockey_hof: bool
-    in_iihf_hof: int
-    in_top_100_all_time: int
-    in_us_hockey_hof: bool
-    is_defected: Literal["Y", "N"]
-    is_deleted: Literal["Y", "N"]
-    is_junior: Literal["Y", "N"]
-    is_retired: Literal[None]
-    is_rookie: Literal["Y", "N"]
-    is_suspended: Literal["Y", "N"]
-    last_ameteur_league_id: Optional[int]
-    last_ameteur_team_id: Optional[int]
-    last_nhl_team_id: Optional[int]
-    last_name: str
-    loan_cap_exception: Literal["Y", "N"]
-    long_term_injury: Literal["Y", "N"]
-    message: Optional[str]
-    middle_name: Optional[str]
-    nationality: Optional[str]
-    nhl_experience: Optional[int]
     on_roster: Literal["Y", "N"]
-    platform_year: Optional[int]
-    position: Optional[Literal["L", "R", "C", "D", "G"]]
-    pr_name: str
-    pr_stat: int
-    pro_year_reduction: Optional[int]
-    reenty_waivers: Optional[Literal["Y", "N"]]
-    roster_special_code: Optional[str]
-    salary_arbitration_exp: Optional[int]
-    shoots_catches: Optional[Literal["L", "R"]]
     sweater_number: Optional[int]
-    update_timestamp: str
-    us_hof_induction_year: Optional[int]
-    vet_cap_exception: Literal["Y", "N"]
-    waiver_amount: Optional[int]
-    waiver_draft: Optional[str]
-    waiver_status: Literal["Y", "N"]
-    weight: Optional[int]
-    years_pro: Optional[int]
+    last_nhl_team_id: Optional[int]
+    current_team_id: Optional[int]
+    is_rookie: Literal["Y", "N"]
+    is_retired: Literal["Y", "N"]
+    is_junior: Literal["Y", "N"]
+    is_suspended: Literal["Y", "N"]
+    deceased: bool
+    date_of_death: Optional[str]
+    nationality: Optional[str]
+    long_term_injury: Literal["Y", "N"]
+    shoots_catches: Optional[Literal["L", "R"]]
+    ep_player_id: Optional[int]
+    dda_id: Optional[int]
 
     def __str__(self) -> str:
         return "{0.full_name}, born {0.birth_date}".format(self)
@@ -237,7 +752,7 @@ class Player:
                 if attr == "height" and self.height:
                     msg += (
                         name
-                        + f"{self.height//12}' {self.height%12}\" / {int(self.height * 2.54)} cm\n"
+                        + f"{self.height // 12}' {self.height % 12}\" / {int(self.height * 2.54)} cm\n"
                     )
                 elif attr == "birth_date" and self.birth_date is not None:
                     years = int(
@@ -245,21 +760,20 @@ class Player:
                         / 365.25
                     )
                     msg += name + f"{getattr(self, attr)} ({years})\n"
-                    flag = FLAG_LOOKUP[self.birth_country]
-                    msg += (
-                        ", ".join(
-                            [
-                                i
-                                for i in [self.birth_city, self.birth_state_province]
-                                if i is not None
-                            ]
-                        )
-                        + f" {flag}\n"
-                    )
+                    flag = FLAG_LOOKUP.get(self.birth_country, "")
+                    birth_loc_order = [
+                        self.birth_city,
+                        self.birth_state_province,
+                    ]
+                    for loc in birth_loc_order:
+                        if not loc:
+                            continue
+                        msg += f"{loc}, "
+                    msg += f"{self.birth_country} {flag}\n"
                 elif attr == "weight" and self.weight:
                     msg += name + f"{self.weight} lbs / {int(self.weight * 0.453592)} kg\n"
                 elif attr == "home_town":
-                    flag = FLAG_LOOKUP[self.nationality]
+                    flag = FLAG_LOOKUP.get(self.nationality, "")
                     msg += name + f"{getattr(self, attr)} {flag}\n"
                 elif attr == "position":
                     shoots = f"({getattr(self, 'shoots_catches', '')})"
@@ -277,7 +791,10 @@ class Player:
                     msg += name + f"{getattr(self, attr)}\n"
         links = [
             _("[Elite Prospects]({ep_url})").format(ep_url=self.ep_url()),
-            _("[Cap Friendly]({cf_url})").format(cf_url=self.cap_friendly_url()),
+            _("[Puckpedia]({cf_url})").format(cf_url=self.puckpedia_url()),
+            _("[The Stanley Cap]({cf_url})").format(cf_url=self.the_stanley_cap_url()),
+            _("[Capwages]({cf_url})").format(cf_url=self.capwages_url()),
+            # _("[Cap Friendly]({cf_url})").format(cf_url=self.cap_friendly_url()),
         ]
         if getattr(self, "dda_id"):
             links.append(
@@ -294,7 +811,7 @@ class Player:
     def get_embed(self) -> discord.Embed:
         try:
             team_id = self.current_team_id or self.last_nhl_team_id
-            log.debug(team_id)
+            log.verbose("SimplePlayer team_id: %s", team_id)
             team_name = [name for name, team in TEAMS.items() if team["id"] == team_id][0]
             colour = int(TEAMS[team_name]["home"].replace("#", ""), 16)
             logo = TEAMS[team_name]["logo"]
@@ -315,8 +832,8 @@ class Player:
         self, season: Optional[str], session: Optional[aiohttp.ClientSession] = None
     ) -> Union[Player, Goalie, Skater]:
         url = f"https://statsapi.web.nhl.com/api/v1/people/{self.id}/stats?stats=yearByYear"
-        log.debug(url)
-        log.debug(season)
+        log.verbose("get_full_stats url: %s", url)
+        log.verbose("get_full_stats url: %s", season)
         if session is None:
             async with aiohttp.ClientSession() as new_session:
                 async with new_session.get(url) as resp:
@@ -346,7 +863,7 @@ class Player:
                         *stats,
                     )
                     return await player.get_full_stats(season or stats_season)
-        log.debug(f"Returning {repr(self)}")
+        log.verbose("Returning %r", self)
         return self
 
     def full_name_url(self) -> str:
@@ -358,8 +875,19 @@ class Player:
     def cap_friendly_url(self) -> str:
         return f"https://www.capfriendly.com/players/{self.full_name_url()}"
 
+    def puckpedia_url(self) -> str:
+        return f"https://puckpedia.com/player/{self.full_name_url()}"
+
+    def the_stanley_cap_url(self) -> str:
+        return f"https://thestanleycap.com/players/{self.full_name_url.lower()}-{self.id}"
+
+    def capwages_url(self) -> str:
+        return f"https://capwages.com/players/{self.full_name_url.lower()}"
+
     @classmethod
-    async def from_id(cls, player_id: int, session: Optional[aiohttp.ClientSession] = None) -> Player:
+    async def from_id(
+        cls, player_id: int, session: Optional[aiohttp.ClientSession] = None
+    ) -> Player:
         url = f"https://records.nhl.com/site/api/player/{player_id}"
         if session is None:
             async with aiohttp.ClientSession() as new_session:
@@ -368,11 +896,77 @@ class Player:
         else:
             async with session.get(url) as resp:
                 data = await resp.json()
+        log.info("SimplePlayer from_id data %s", data)
         return cls(*data["data"][0].values())
 
 
 @dataclass
-class Skater(Player):
+class Player(SimplePlayer):
+    id: int
+    accrued_seasons: Optional[int]
+    add_names: Optional[str]
+    age_signed_waiver: Optional[int]
+    age_signel_fa: Optional[int]
+    alert: Literal["Y", "N"]
+    career_team_id: Optional[int]
+    central_registry_position: Optional[str]
+    club_elect_arb: Literal["Y", "N"]
+    current_team_id: Optional[int]
+    date_of_death: Optional[str]
+    dda_id: Optional[int]
+    deceased: bool
+    ep_player_id: Optional[int]
+    fa_group_after_season: Literal[None]
+    first_name: str
+    first_signed_by_team_id: Optional[int]
+    free_agent_group: Optional[str]
+    group_5_election: Literal["Y", "N"]
+    group_5_seasons_earned: Optional[int]
+    group_6_proration: Literal[None]
+    group_6_seasons_earned: Optional[int]
+    groups_earned_thru_season: Optional[int]
+    hof_induction_year: Optional[int]
+    iihf_hof_induction_year: Optional[int]
+    in_hockey_hof: bool
+    in_iihf_hof: int
+    in_top_100_all_time: int
+    in_us_hockey_hof: bool
+    is_defected: Literal["Y", "N"]
+    is_deleted: Literal["Y", "N"]
+    is_junior: Literal["Y", "N"]
+    is_retired: Literal[None]
+    is_rookie: Literal["Y", "N"]
+    is_suspended: Literal["Y", "N"]
+    last_ameteur_league_id: Optional[int]
+    last_ameteur_team_id: Optional[int]
+    last_nhl_team_id: Optional[int]
+    last_name: str
+    loan_cap_exception: Literal["Y", "N"]
+    long_term_injury: Literal["Y", "N"]
+    message: Optional[str]
+    middle_name: Optional[str]
+    nationality: Optional[str]
+    nhl_experience: Optional[int]
+    platform_year: Optional[int]
+    pr_name: str
+    pr_stat: int
+    pro_year_reduction: Optional[int]
+    reenty_waivers: Optional[Literal["Y", "N"]]
+    roster_special_code: Optional[str]
+    salary_arbitration_exp: Optional[int]
+    shoots_catches: Optional[Literal["L", "R"]]
+    update_timestamp: str
+    us_hof_induction_year: Optional[int]
+    vet_cap_exception: Literal["Y", "N"]
+    waiver_amount: Optional[int]
+    waiver_draft: Optional[str]
+    waiver_status: Literal["Y", "N"]
+    weight: Optional[int]
+    years_pro: Optional[int]
+
+
+@dataclass
+class Skater(SimplePlayer):
     season: str
     time_on_ice: str
     assists: int
@@ -414,8 +1008,8 @@ class Skater(Player):
         url = (
             f"https://statsapi.web.nhl.com/api/v1/people/{self.id}/stats?stats=yearByYearPlayoffs"
         )
-        log.debug(url)
-        log.debug(season)
+        log.debug("Skater get_full_stats url: %s", url)
+        log.debug("Skater get_full_stats season: %s", season)
         if session is None:
             async with aiohttp.ClientSession() as new_session:
                 async with new_session.get(url) as resp:
@@ -449,7 +1043,7 @@ class Skater(Player):
     def get_embed(self) -> discord.Embed:
         try:
             team_id = self.current_team_id
-            log.debug(team_id)
+            log.debug("Skater get_embed team_id: %s", team_id)
             team_name = [name for name, team in TEAMS.items() if team["id"] == team_id][0]
             colour = int(TEAMS[team_name]["home"].replace("#", ""), 16)
             logo = TEAMS[team_name]["logo"]
@@ -459,9 +1053,9 @@ class Skater(Player):
             logo = "https://cdn.bleacherreport.net/images/team_logos/328x328/nhl.png"
         try:
             team_id = self.last_nhl_team_id
-            log.debug(team_id)
+            log.debug("Skater get_embed team_id: %s", team_id)
             team_name = [name for name, team in TEAMS.items() if team["id"] == team_id][0]
-            emoji = f'<:{TEAMS[team_name]["emoji"]}>'
+            emoji = f"<:{TEAMS[team_name]['emoji']}>"
         except IndexError:
             team_name = _("No Team")
             emoji = ""
@@ -471,22 +1065,22 @@ class Skater(Player):
         em.set_thumbnail(url=self.headshot())
         em.description = self.description()
         post_data = [
-            [_("GP"), f"[ {self.games} ]"],
-            [_("Shots"), f"[ {self.shots} ]"],
-            [_("Goals"), f"[ {self.goals} ]"],
-            [_("Assists"), f"[ {self.assists} ]"],
-            [_("Hits"), f"[ {self.hits} ]"],
-            [_("Faceoff %"), f"[ {self.face_off_percent} ]"],
-            ["+/-", f"[ {self.plusminus} ]"],
-            [_("Blocked Shots"), f"[ {self.blocked} ]"],
-            [_("PIM"), f"[ {self.pim} ]"],
-            [_("Avg. TOI"), f"[ {self.time_on_ice_average()} ]"],
+            [_("GP"), f"{self.games}"],
+            [_("Shots"), f"{self.shots}"],
+            [_("Goals"), f"{self.goals}"],
+            [_("Assists"), f"{self.assists}"],
+            [_("Hits"), f"{self.hits}"],
+            [_("Faceoff %"), f"{self.face_off_percent}"],
+            ["+/-", f"{self.plusminus}"],
+            [_("Blocked Shots"), f"{self.blocked}"],
+            [_("PIM"), f"{self.pim}"],
+            [_("Avg. TOI"), f"{self.time_on_ice_average()}"],
         ]
         stats_md = tabulate(
             post_data, headers=[_("Stats"), f"{self.season[:4]}-{self.season[4:]}"]
         )
         em.set_thumbnail(url=self.headshot())
-        stats_str = f"{emoji} {team_name} {emoji}\n{box(stats_md, lang='apache')}"
+        stats_str = f"{emoji} {team_name} {emoji}\n{box(stats_md, lang='asni')}"
         em.add_field(name=_("Stats"), value=stats_str)
         return em
 
@@ -541,7 +1135,7 @@ class SkaterPlayoffs(Skater):
     def get_embed(self) -> discord.Embed:
         try:
             team_id = self.current_team_id
-            log.debug(team_id)
+            log.debug("SkaterPlayoffs get_embed team_id: %s", team_id)
             team_name = [name for name, team in TEAMS.items() if team["id"] == team_id][0]
             colour = int(TEAMS[team_name]["home"].replace("#", ""), 16)
             logo = TEAMS[team_name]["logo"]
@@ -551,9 +1145,9 @@ class SkaterPlayoffs(Skater):
             logo = "https://cdn.bleacherreport.net/images/team_logos/328x328/nhl.png"
         try:
             team_id = self.last_nhl_team_id
-            log.debug(team_id)
+            log.debug("SkaterPlayoffs get_embed team_id: %s", team_id)
             team_name = [name for name, team in TEAMS.items() if team["id"] == team_id][0]
-            emoji = f'<:{TEAMS[team_name]["emoji"]}>'
+            emoji = f"<:{TEAMS[team_name]['emoji']}>"
         except IndexError:
             team_name = _("No Team")
             emoji = ""
@@ -563,19 +1157,19 @@ class SkaterPlayoffs(Skater):
         em.set_thumbnail(url=self.headshot())
         em.description = self.description()
         post_data = [
-            [_("GP"), f"[ {self.games} ]", f"[ {self.p_games} ]"],
-            [_("Shots"), f"[ {self.shots} ]", f"[ {self.p_shots} ]"],
-            [_("Goals"), f"[ {self.goals} ]", f"[ {self.p_goals} ]"],
-            [_("Assists"), f"[ {self.assists} ]", f"[ {self.p_assists} ]"],
-            [_("Hits"), f"[ {self.hits} ]", f"[ {self.p_hits} ]"],
-            [_("Faceoff %"), f"[ {self.face_off_percent} ]", f"[ {self.p_face_off_percent} ]"],
-            ["+/-", f"[ {self.plusminus} ]", f"[ {self.p_plusminus} ]"],
-            [_("Blocked"), f"[ {self.blocked} ]", f"[ {self.p_blocked} ]"],
-            [_("PIM"), f"[ {self.pim} ]", f"[ {self.p_pim} ]"],
+            [_("GP"), f"{self.games}", f"{self.p_games}"],
+            [_("Shots"), f"{self.shots}", f"{self.p_shots}"],
+            [_("Goals"), f"{self.goals}", f"{self.p_goals}"],
+            [_("Assists"), f"{self.assists}", f"{self.p_assists}"],
+            [_("Hits"), f"{self.hits}", f"{self.p_hits}"],
+            [_("Faceoff %"), f"{self.face_off_percent}", f"{self.p_face_off_percent}"],
+            ["+/-", f"{self.plusminus}", f"{self.p_plusminus}"],
+            [_("Blocked"), f"{self.blocked}", f"{self.p_blocked}"],
+            [_("PIM"), f"{self.pim}", f"{self.p_pim}"],
             [
                 _("Avg. TOI"),
-                f"[ {self.time_on_ice_average()} ]",
-                f"[ {self.p_time_on_ice_average()} ]",
+                f"{self.time_on_ice_average()}",
+                f"{self.p_time_on_ice_average()}",
             ],
         ]
         stats_md = tabulate(
@@ -589,7 +1183,7 @@ class SkaterPlayoffs(Skater):
 
 
 @dataclass
-class Goalie(Player):
+class Goalie(SimplePlayer):
     season: str
     time_on_ice: str
     ot: int
@@ -627,8 +1221,8 @@ class Goalie(Player):
         url = (
             f"https://statsapi.web.nhl.com/api/v1/people/{self.id}/stats?stats=yearByYearPlayoffs"
         )
-        log.debug(url)
-        log.debug(season)
+        log.verbose("Goalie get_full_stats url: %s", url)
+        log.verbose("Goalie get_full_stats season: %s", season)
         if session is None:
             async with aiohttp.ClientSession() as new_session:
                 async with new_session.get(url) as resp:
@@ -651,7 +1245,7 @@ class Goalie(Player):
     def get_embed(self) -> discord.Embed:
         try:
             team_id = self.current_team_id
-            log.debug(team_id)
+            log.verbose("Goalie team_id: %s", team_id)
             team_name = [name for name, team in TEAMS.items() if team["id"] == team_id][0]
             colour = int(TEAMS[team_name]["home"].replace("#", ""), 16)
             logo = TEAMS[team_name]["logo"]
@@ -661,9 +1255,9 @@ class Goalie(Player):
             logo = "https://cdn.bleacherreport.net/images/team_logos/328x328/nhl.png"
         try:
             team_id = self.last_nhl_team_id
-            log.debug(team_id)
+            log.verbose("Goalie team_id: %s", team_id)
             team_name = [name for name, team in TEAMS.items() if team["id"] == team_id][0]
-            emoji = f'<:{TEAMS[team_name]["emoji"]}>'
+            emoji = f"<:{TEAMS[team_name]['emoji']}>"
         except IndexError:
             team_name = _("No Team")
             emoji = ""
@@ -673,12 +1267,12 @@ class Goalie(Player):
         em.set_thumbnail(url=self.headshot())
         em.description = self.description()
         post_data = [
-            [_("GP"), f"[ {self.games} ]"],
-            [_("SO"), f"[ {self.shutouts} ]"],
-            [_("Saves"), f"[ {self.saves} ]"],
-            [_("Save %"), f"[ {self.save_percentage} ]"],
-            [_("GAA"), f"[ {self.goals_against_average} ]"],
-            [_("Started"), f"[ {self.games_started} ]"],
+            [_("GP"), f"{self.games}"],
+            [_("SO"), f"{self.shutouts}"],
+            [_("Saves"), f"{self.saves}"],
+            [_("Save %"), f"{self.save_percentage}"],
+            [_("GAA"), f"{self.goals_against_average}"],
+            [_("Started"), f"{self.games_started}"],
         ]
         stats_md = tabulate(
             post_data, headers=[_("Stats"), f"{self.season[:4]}-{self.season[4:]}"]
@@ -724,7 +1318,7 @@ class GoaliePlayoffs(Goalie):
     def get_embed(self) -> discord.Embed:
         try:
             team_id = self.current_team_id
-            log.debug(team_id)
+            log.verbose("GoaliePlayoffs team_id: %s", team_id)
             team_name = [name for name, team in TEAMS.items() if team["id"] == team_id][0]
             colour = int(TEAMS[team_name]["home"].replace("#", ""), 16)
             logo = TEAMS[team_name]["logo"]
@@ -734,9 +1328,9 @@ class GoaliePlayoffs(Goalie):
             logo = "https://cdn.bleacherreport.net/images/team_logos/328x328/nhl.png"
         try:
             team_id = self.last_nhl_team_id
-            log.debug(team_id)
+            log.verbose("GoaliePlayoffs team_id: %s", team_id)
             team_name = [name for name, team in TEAMS.items() if team["id"] == team_id][0]
-            emoji = f'<:{TEAMS[team_name]["emoji"]}>'
+            emoji = f"<:{TEAMS[team_name]['emoji']}>"
         except IndexError:
             team_name = _("No Team")
             emoji = ""
@@ -746,12 +1340,12 @@ class GoaliePlayoffs(Goalie):
         em.set_thumbnail(url=self.headshot())
         em.description = self.description()
         post_data = [
-            [_("GP"), f"[ {self.games} ]", f"[ {self.p_games} ]"],
-            [_("SO"), f"[ {self.shutouts} ]", f"[ {self.p_shutouts} ]"],
-            [_("Saves"), f"[ {self.saves} ]", f"[ {self.p_saves} ]"],
-            [_("Save %"), f"[ {self.save_percentage} ]", f"[ {self.p_save_percentage} ]"],
-            [_("GAA"), f"[ {self.goals_against_average} ]", f"[ {self.p_goals_against_average} ]"],
-            [_("Started"), f"[ {self.games_started} ]", f"[ {self.p_games_started} ]"],
+            [_("GP"), f"{self.games}", f"{self.p_games}"],
+            [_("SO"), f"{self.shutouts}", f"{self.p_shutouts}"],
+            [_("Saves"), f"{self.saves}", f"{self.p_saves}"],
+            [_("Save %"), f"{self.save_percentage}", f"{self.p_save_percentage}"],
+            [_("GAA"), f"{self.goals_against_average}", f"{self.p_goals_against_average}"],
+            [_("Started"), f"{self.games_started}", f"{self.p_games_started}"],
         ]
 
         stats_md = tabulate(

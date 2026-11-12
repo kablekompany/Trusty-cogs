@@ -1,95 +1,115 @@
+from __future__ import annotations
+
+import bisect
+import json
+import re
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+from typing import Dict, List, NamedTuple, Optional
 
-import pytz
-from redbot.core.utils.chat_formatting import humanize_number
+import aiohttp
+import discord
+from red_commons.logging import getLogger
+from redbot.core.utils.chat_formatting import humanize_number, pagify
 from tabulate import tabulate
 
+from .helpers import HEADERS, IMAGE_URL
+from .xp import ELITE_XP, XP_TABLE
 
-class Skills(Enum):
-    Attack = 0
-    Defence = 1
-    Strength = 2
-    Constitution = 3
-    Ranged = 4
-    Prayer = 5
-    Magic = 6
-    Cooking = 7
-    Woodcutting = 8
-    Fletching = 9
-    Fishing = 10
-    Firemaking = 11
-    Crafting = 12
-    Smithing = 13
-    Mining = 14
-    Herblore = 15
-    Agility = 16
-    Thieving = 17
-    Slayer = 18
-    Farming = 19
-    Runecrafting = 20
-    Hunter = 21
-    Construction = 22
-    Summoning = 23
-    Dungeoneering = 24
-    Divination = 25
-    Invention = 26
-    Archaeology = 27
+log = getLogger("red.trusty-cogs.runescape")
+
+LVL_RE = re.compile(r"Levelled Up (\w+)", flags=re.I)
+XP_RE = re.compile(r"(?P<xp>\d+)XP IN (.+)", flags=re.I)
+KILLED_RE = re.compile(r"(?:I )?(?:killed|defeated) (?:\d+ |the )?([a-z \-,]+)", flags=re.I)
+FOUND_RE = re.compile(r"I found (?:a pair of|some|a|an) (.+)", flags=re.I)
 
 
-class Item:
-    def __init__(self, *args, **kwargs):
-        self.id = kwargs.get("id")
-        self.icon = kwargs.get("icon")
-        self.icon_large = kwargs.get("icon_large")
-        self.type = kwargs.get("type")
-        self.type_icon = kwargs.get("type_icon")
-        self.name = kwargs.get("name")
-        self.description = kwargs.get("description")
-        self.members = kwargs.get("members")
-        self.trend = kwargs.get("trend")
-        self.price = kwargs.get("price")
-        self.change = kwargs.get("change")
-        self.current = kwargs.get("current")
-        self.today = kwargs.get("today")
-        self.day30 = kwargs.get("day30")
-        self.day90 = kwargs.get("day90")
-        self.day180 = kwargs.get("day180")
+class APIError(Exception):
+    pass
+
+
+class PrivateProfileError(APIError):
+    pass
+
+
+class PlayerID(NamedTuple):
+    id: int
+    name: str
 
 
 @dataclass
-class Activity:
-    date: datetime
-    details: str
-    text: str
-    id: str
+class HiScorePlayer:
+    id: int
+    bossId: int
+    size: int
+    rank: int
+    enrage: int
+    killTimeSeconds: float
+    timeOfKill: int
+    members: List[PlayerID]
 
     @classmethod
-    def from_json(cls, data: dict):
-        tz = pytz.timezone("Europe/London")
-        date = datetime.strptime(data.get("date"), "%d-%b-%Y %H:%M")
-        date = tz.localize(date, is_dst=None).astimezone(timezone.utc)
-        text = data.get("text")
-        activity_id = f"{int(date.timestamp())}-{text}"
-        return cls(
-            date=date,
-            details=data.get("details"),
-            text=text,
-            id=activity_id,
-        )
+    def from_json(cls, data: dict) -> HiScorePlayer:
+        members = [PlayerID(**i) for i in data.pop("members", [])]
+        return cls(members=members, **data)
+
+
+@dataclass
+class ZamorakHiScores:
+    content: List[HiScorePlayer]
+    totalElements: int
+    totalPages: int
+    first: bool
+    last: bool
+    numberOfElements: int
+    number: int
+    size: int
+    empty: bool
+    url: str = "https://secure.runescape.com/m=group_hiscores/v1//groups?groupSize={groupSize}&size={size}&bossId=1&page={page}"
+
+    @classmethod
+    def from_json(cls, data: dict) -> ZamorakHiScores:
+        content = [HiScorePlayer.from_json(i) for i in data.pop("content", [])]
+        return cls(content=content, **data)
+
+    @classmethod
+    async def get(
+        cls,
+        groupSize: int,
+        size: int,
+        page: int,
+        *,
+        session: Optional[aiohttp.ClientSession] = None,
+    ) -> ZamorakHiScores:
+        if session is None:
+            async with aiohttp.ClientSession(headers=HEADERS) as session:
+                async with session.get(
+                    cls.url.format(groupSize=groupSize, size=size, page=page)
+                ) as resp:
+                    if resp.status != 200:
+                        raise APIError
+                    data = await resp.json()
+        else:
+            async with session.get(
+                cls.url.format(groupSize=groupSize, size=size, page=page)
+            ) as resp:
+                if resp.status != 200:
+                    raise APIError
+                data = await resp.json()
+        return cls.from_json(data)
 
 
 class Activities:
     def __init__(self, *args, **kwargs):
-        self.channels = kwargs.get("channels")
-        self.last_id: str = kwargs.get("last_id")
+        self.channels: Dict[str, int] = kwargs.get("channels", {})
+        self.last_id: str = kwargs.get("last_id", "")
         self.last_timestamp = kwargs.get("last_timestamp")
-        self.username: str = kwargs.get("username")
-        self.posted_activities: deque = deque(kwargs.get("posted_activities", []), 20)
+        self.username: str = kwargs.get("username", "")
+        self.posted_activities: deque = deque(kwargs.get("posted_activities", []), 40)
 
-    def to_json(self):
+    def to_json(self) -> dict:
         return {
             "channels": self.channels,
             "last_id": self.last_id,
@@ -100,230 +120,362 @@ class Activities:
 
 
 @dataclass
-class Skill:
-    level: int
-    xp: int
-    rank: int
-    id: int
+class PlayerDetails:
+    isSuffix: bool
     name: str
+    title: str
+    recruiting: Optional[bool] = None
+    clan: Optional[str] = None
+    online: Optional[bool] = False
+    world: Optional[str] = None
+
+    @classmethod
+    def from_str(cls, data_str: str) -> PlayerDetails:
+        try:
+            data = json.loads(
+                data_str.replace("jQuery000000000000000_0000000000([", "").replace("]);", "")
+            )
+        except Exception:
+            log.exception("Error pulling player details")
+            raise APIError
+        return cls(**data)
+
+    @classmethod
+    async def get(
+        cls, runescape_name: str, *, session: Optional[aiohttp.ClientSession] = None
+    ) -> PlayerDetails:
+        url = f"https://secure.runescape.com/m=website-data/playerDetails.ws?names=%5B%22{runescape_name}%22%5D&callback=jQuery000000000000000_0000000000&_=0.format"
+        close_session = session is None
+        if session is None:
+            session = aiohttp.ClientSession(headers=HEADERS)
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                raise APIError
+            data = await resp.text()
+        if close_session:
+            await session.close()
+        return cls.from_str(data)
+
+
+class PlogType(Enum):
+    UNKNOWN = "unknown_plog_type"
+    XP_MILESTONE = "rs_plog_xp_milestone"
+    LEVELUP_COUNT = "rs_plog_levelup_count"
+    LEVELUP_ALL_MILESTONE = "rs_plog_levelup_all_milestone"
+    LEVELUP_TOTAL_MILESTONE = "rs_plog_levelup_total_milestone"
+    ITEM_DROP = "rs_plog_item_drop"
+    NPC_KILL_COUNT = "rs_plog_npc_kill_count"
+    NPC_DEFEAT = "rs_plog_npc_defeat"
+    ITEM_FOUND = "rs_plog_item_found"
+    ITEM_FOUND_NOWHERE = "rs_plog_item_found_nowhere"
+    QUEST = "rs_plog_quest"
+    QP_MILESTONE = "rs_plog_qp_milestone"
+    CHAMPIONS_CHALLENGE = "rs_plog_champions_challenge"
+    COURTCASE = "rs_plog_courtcase"
+    FINISHED_TRAIL = "rs_plog_finished_trail"
+    DUNGEONS_DEEPEST_LEVEL = "rs_plog_dungeons_deepest_level"
+    DUNGEONS_BOSS_KILLS = "rs_plog_dungeons_boss_kills"
+    DUNGEONS_FOUND_BOOK = "rs_plog_dungeons_found_book"
+    MUSIC_MILESTONE = "rs_plog_music_milestone"
+    SPECIAL_EVENT = "rs_plog_special_event"
+    # Depracated evnents that might still show up
+    LEVEL_UPS = "rs_plog_levelup"
+    NPC_KILLS = "rs_plog_npc_kill"
+    PVP_KILL = "rs_plog_pvp_kill"
+    HOLIDAY_EVENTS = "rs_plog_events"
+    TREASURE_HUNTER_DROP = "rs_plog_wof_drop"
+    DUNGEONEERING_TOKEN_SPENT = "rs_plog_dungeons_spend_token"
+
+    @classmethod
+    def from_str(cls, data: str):
+        try:
+            return PlogType(data)
+        except ValueError:
+            return PlogType.UNKNOWN
+
+
+@dataclass
+class PlayerEvent:
+    date: datetime
+    details: str
+    text: str
+    type: PlogType
+    id: str
 
     @classmethod
     def from_json(cls, data: dict):
-        return cls(
-            level=data.get("level", 1),
-            xp=int(data.get("xp", 1) * 0.1),
-            rank=data.get("rank", 0),
-            id=data.get("id"),
-            name=Skills(int(data.get("id"))).name,
+        plog_type = data.pop("type", "unknown_plog_type")
+        try:
+            date_str = data.pop("date").replace("Z", "+00:00")
+            date = datetime.fromisoformat(date_str)
+        except (ValueError, KeyError, TypeError):
+            log.exception("Error getting date from data")
+            date = datetime.now(tz=timezone.utc)
+        event_text = data.get("text", "")
+        event_id = f"{int(date.timestamp())}-{event_text}"
+
+        return cls(**data, date=date, type=PlogType.from_str(plog_type), id=event_id)
+
+    def _get_image_details_text(self):
+        text = self.text
+        details = self.details
+        image_url = None
+        page = None
+        if match := KILLED_RE.search(self.text):
+            page = match.group(1).strip()
+            if page.endswith("s"):
+                page = page[:-1]
+            page = page.replace(" ", "_")
+            if "-" in page:
+                page = page.title()
+            else:
+                page = page.capitalize()
+            image_url = IMAGE_URL + page + ".png"
+        if match := XP_RE.search(self.text):
+            page = match.group(2).strip()
+            if xp := match.group("xp"):
+                number = humanize_number(int(xp))
+                text = self.text.replace(xp, number)
+                details = self.details.replace(xp, number)
+            image_url = IMAGE_URL + page.replace(" ", "_").capitalize() + ".png"
+        if match := LVL_RE.search(self.text):
+            page = match.group(1).strip()
+            image_url = IMAGE_URL + page.replace(" ", "_").capitalize() + ".png"
+        if match := FOUND_RE.search(self.text):
+            page = match.group(1).strip() + " detail"
+            image_url = IMAGE_URL + page.replace(" ", "_").capitalize() + ".png"
+        return text, details, image_url
+
+    def format_text(self) -> str:
+        text, details, _image_url = self._get_image_details_text()
+        ts = discord.utils.format_dt(self.date)
+        return f"- {text}\n  - {details}\n  - -# {ts}\n"
+
+    def embed(self, username: str) -> discord.Embed:
+        # url = f"https://apps.runescape.com/runemetrics/app/overview/player/{profile.name}"
+        # msg = f"{profile.name}: {activity.text}\n{activity.details}\n\n"
+        ts = discord.utils.format_dt(self.date)
+        text, details, image_url = self._get_image_details_text()
+        embed = discord.Embed(title=text, description=f"{details}\n\n{ts}")
+        name_url = username.replace(" ", "%20")
+        avatar = f"http://secure.runescape.com/m=avatar-rs/{name_url}/chat.png"
+        embed.set_author(name=username, icon_url=avatar)
+        if image_url is not None:
+            embed.set_thumbnail(url=image_url)
+        return embed
+
+
+@dataclass
+class PlayerEvents:
+    name: str
+    events: List[PlayerEvent]
+
+    @property
+    def avatar(self) -> str:
+        name_url = self.name.replace(" ", "%20")
+        return f"http://secure.runescape.com/m=avatar-rs/{name_url}/chat.png"
+
+    @classmethod
+    def from_json(cls, data: dict):
+        name = data.get("name", "")
+        events = [PlayerEvent.from_json(e) for e in data.get("events", [])]
+        return cls(name=name, events=events)
+
+    @classmethod
+    async def get(
+        cls,
+        runescape_name: str,
+        *,
+        session: Optional[aiohttp.ClientSession] = None,
+    ) -> PlayerEvents:
+        url = (
+            f"https://secure.runescape.com/m=adventurers-log/api/v1/playerEvents/{runescape_name}"
         )
+        close_session = session is None
+        if session is None:
+            session = aiohttp.ClientSession(headers=HEADERS)
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                raise APIError
+            data = await resp.json()
+        if close_session:
+            await session.close()
+        if "error" in data:
+            if data["error"] == "PROFILE_PRIVATE":
+                raise PrivateProfileError(data["error"])
+            else:
+                raise APIError(data["error"])
+        return cls.from_json(data)
+
+    def embed(self) -> discord.Embed:
+        em = discord.Embed(title="Adventure Log")
+        em.set_author(name=self.name, icon_url=self.avatar)
+        em.set_thumbnail(url=self.avatar)
+        desc = ""
+        for event in self.events:
+            to_add = event.format_text()
+            if len(desc) + len(to_add) < 1024:
+                desc += to_add
+            else:
+                break
+        em.description = desc
+        return em
 
 
-class Profile:
-    def __init__(self, **kwargs):
-        self.name = kwargs.get("name")
-        self.combatlevel = kwargs.get("combatlevel")
-        self.logged_in = kwargs.get("logged_in")
-        self.rank = kwargs.get("rank")
-        self.melee_total = kwargs.get("melee_total")
-        self.magic_total = kwargs.get("magic_total")
-        self.ranged_total = kwargs.get("ranged_total")
-        self.totalskill = kwargs.get("totalskill")
-        self.totalxp = kwargs.get("totalxp")
-        self.questsstarted = kwargs.get("questsstarted")
-        self.questscomplete = kwargs.get("questscomplete")
-        self.questsnotstarted = kwargs.get("questsnotstarted")
-        self.activities = kwargs.get("activities")
-        self.attack: Skill = kwargs.get("attack")
-        self.defence: Skill = kwargs.get("defence")
-        self.strength: Skill = kwargs.get("strength")
-        self.constitution: Skill = kwargs.get("constitution")
-        self.ranged: Skill = kwargs.get("ranged")
-        self.prayer: Skill = kwargs.get("prayer")
-        self.magic: Skill = kwargs.get("magic")
-        self.cooking: Skill = kwargs.get("cooking")
-        self.woodcutting: Skill = kwargs.get("woodcutting")
-        self.fletching: Skill = kwargs.get("fletching")
-        self.fishing: Skill = kwargs.get("fishing")
-        self.firemaking: Skill = kwargs.get("firemaking")
-        self.crafting: Skill = kwargs.get("crafting")
-        self.smithing: Skill = kwargs.get("smithing")
-        self.mining: Skill = kwargs.get("mining")
-        self.herblore: Skill = kwargs.get("herblore")
-        self.agility: Skill = kwargs.get("agility")
-        self.thieving: Skill = kwargs.get("thieving")
-        self.slayer: Skill = kwargs.get("slayer")
-        self.farming: Skill = kwargs.get("farming")
-        self.runecrafting: Skill = kwargs.get("runecrafting")
-        self.hunter: Skill = kwargs.get("hunter")
-        self.construction: Skill = kwargs.get("construction")
-        self.summoning: Skill = kwargs.get("summoning")
-        self.dungeoneering: Skill = kwargs.get("dungeoneering")
-        self.divination: Skill = kwargs.get("divination")
-        self.invention: Skill = kwargs.get("invention")
-        self.archaeology: Skill = kwargs.get("archaeology")
+class HiscoreInstance(Enum):
+    # RS3
+    HISCORE = "hiscore"
+    HISCORE_IRONMAN = "hiscore_ironman"
+    HISCORE_HARDCORE_IRONMAN = "hiscore_hardcore_ironman"
+    HISCORE_LEAGUE = "hiscore_leagues"
+    # OSRS
+    HISCORE_OLDSCHOOL = "hiscore_oldschool"
+    HISCORE_OLDSCHOOL_SKILLER_DEFENCE = "hiscore_oldschool_skiller_defence"
+    HISCORE_OLDSCHOOL_SKILLER = "hiscore_oldschool_skiller"
+    HISCORE_OLDSCHOOL_IRONMAN = "hiscore_oldschool_ironman"
+    HISCORE_OLDSCHOOL_HARDCORE_IRONMAN = "hiscore_oldschool_hardcore_ironman"
+    HISCORE_OLDSCHOOL_UTMIATE = "hiscore_oldschool_ultimate"
+    HISCORE_OLDSCHOOL_HARDCORE_MAINS = "hiscore_oldschool_hardcore_mains"
+    HISCORE_OLDSCHOOL_DEADMAN = "hiscore_oldschool_deadman"
+    HISCORE_OLDSCHOOL_SEASONAL = "hiscore_oldschool_seasonal"
+    HISCORE_OLDSCHOOL_TOURNAMENT = "hiscore_oldschool_tournament"
+    HISCORE_OLDSCHOOL_FRESH_START = "hiscore_oldschool_fresh_start"
+
+    @property
+    def is_rs3(self) -> bool:
+        return "oldschool" not in self.value
+
+    @property
+    def to_str(self) -> str:
+        game = "RS3" if self.is_rs3 else "OSRS"
+        name_str = " ".join(self.value.replace("_", " ").replace("oldschool", "").title().split())
+        return f"{game} {name_str}"
+
+
+class HiscoreSkill(NamedTuple):
+    id: int
+    name: str
+    rank: int
+    level: int
+    xp: int
 
     def __str__(self):
-        skills_list = [["Overall", self.totalskill, "{:,}".format(self.totalxp), self.rank]]
-        for skill_name in Skills:
-            skill = getattr(self, skill_name.name.lower(), None)
-            if not skill:
-                level = 1
-                xp = 0
-                rank = "Unranked"
-                skills_list.append([skill_name, level, xp, rank])
-                continue
-            level = skill.level
-            xp = skill.xp
-            rank = "Unranked"
-            if skill.rank:
-                rank = humanize_number(skill.rank)
-            skills_list.append([skill.name, level, humanize_number(xp), rank])
-        return tabulate(skills_list, headers=["Skill", "Level", "Experience", "Rank"])
+        return self.name
 
-    def to_json(self) -> dict:
-        return {
-            "name": self.name,
-            "combatlevel": self.combatlevel,
-            "logged_in": self.logged_in,
-            "rank": self.rank,
-            "melee_total": self.melee_total,
-            "magic_total": self.magic_total,
-            "ranged_total": self.ranged_total,
-            "totalskill": self.totalskill,
-            "totalxp": self.totalxp,
-            "questsstarted": self.questsstarted,
-            "questscomplete": self.questscomplete,
-            "questsnotstarted": self.questsnotstarted,
-            "activities": self.activities,
-            "attack": self.attack,
-            "defence": self.defence,
-            "strength": self.strength,
-            "constitution": self.constitution,
-            "ranged": self.ranged,
-            "prayer": self.prayer,
-            "magic": self.magic,
-            "cooking": self.cooking,
-            "woodcutting": self.woodcutting,
-            "fletching": self.fletching,
-            "fishing": self.fishing,
-            "firemaking": self.firemaking,
-            "crafting": self.crafting,
-            "smithing": self.smithing,
-            "mining": self.mining,
-            "herblore": self.herblore,
-            "agility": self.agility,
-            "thieving": self.thieving,
-            "slayer": self.slayer,
-            "farming": self.farming,
-            "runecrafting": self.runecrafting,
-            "hunter": self.hunter,
-            "construction": self.construction,
-            "summoning": self.summoning,
-            "dungeoneering": self.dungeoneering,
-            "divination": self.divination,
-            "invention": self.invention,
-            "archaeology": self.archaeology,
-        }
+    @property
+    def virtual_level(self) -> int:
+        if self.level < 99:
+            return self.level
+        table = XP_TABLE
+        max_level = 126
+        if self.name == "Invention":
+            table = ELITE_XP
+            max_level = 150
+        idx = bisect.bisect_right(table, self.xp, lo=98)
+        # Since the xp list is already sorted we can bisect and
+        # do a binary search for where our xp fits in the level brackets.
+        # Since we only care about levels above 99
+        # the lo sets the lowest index to start looking
+        return min(idx, max_level)
+
+
+class HiscoreActivity(NamedTuple):
+    id: int
+    name: str
+    rank: int
+    score: int
+
+    def __str__(self):
+        return self.name
+
+
+@dataclass
+class HiscoreProfile:
+    def __init__(
+        self,
+        name: str,
+        skills: Dict[int, HiscoreSkill],
+        activities: Dict[int, HiscoreActivity],
+        instance: HiscoreInstance,
+    ):
+        self.skills: Dict[int, HiscoreSkill] = skills
+        self.activities: Dict[int, HiscoreActivity] = activities
+        self.name: str = name
+        self.instance = instance
+
+    def get_skill(self, skill_name: str) -> Optional[HiscoreSkill]:
+        for skill in self.skills.values():
+            if skill.name == skill_name:
+                return skill
+        return None
+
+    def get_activity(self, activity_name: str) -> Optional[HiscoreActivity]:
+        for activity in self.activities.values():
+            if activity.name == activity_name:
+                return activity
+        return None
 
     @classmethod
-    async def from_json(cls, data: dict):
-        def get_skill(skill_id):
-            for skill in data["skillvalues"]:
-                if skill["id"] == skill_id:
-                    return Skill.from_json(skill)
+    async def get(
+        cls,
+        runescape_name: str,
+        instance: HiscoreInstance,
+        *,
+        session: Optional[aiohttp.ClientSession] = None,
+    ) -> HiscoreProfile:
+        url = f"https://secure.runescape.com/m={instance.value}/index_lite.json"
+        close_session = session is None
+        params = {"player": runescape_name}
+        if session is None:
+            session = aiohttp.ClientSession(headers=HEADERS)
+        async with session.get(url, params=params) as resp:
+            if resp.status != 200:
+                raise APIError
+            data = await resp.json()
+        if close_session:
+            await session.close()
+        skills = {}
+        activities = {}
+        for skill in data.get("skills", []):
+            skills[skill["id"]] = HiscoreSkill(**skill)
+        for activity in data.get("activities", []):
+            activities[activity["id"]] = HiscoreActivity(**activity)
+        return cls(runescape_name, skills, activities, instance)
 
-        logged_in = True if data["loggedIn"] == "true" else False
-
-        return cls(
-            name=data["name"],
-            combatlevel=data["combatlevel"],
-            logged_in=logged_in,
-            rank=data["rank"],
-            melee_total=data["melee"],
-            magic_total=data["magic"],
-            ranged_total=data["ranged"],
-            totalskill=data["totalskill"],
-            totalxp=data["totalxp"],
-            questsstarted=data["questsstarted"],
-            questscomplete=data["questscomplete"],
-            questsnotstarted=data["questsnotstarted"],
-            activities=[Activity.from_json(i) for i in data["activities"]],
-            attack=get_skill(0),
-            defence=get_skill(1),
-            strength=get_skill(2),
-            constitution=get_skill(3),
-            ranged=get_skill(4),
-            prayer=get_skill(5),
-            magic=get_skill(6),
-            cooking=get_skill(7),
-            woodcutting=get_skill(8),
-            fletching=get_skill(9),
-            fishing=get_skill(10),
-            firemaking=get_skill(11),
-            crafting=get_skill(12),
-            smithing=get_skill(13),
-            mining=get_skill(14),
-            herblore=get_skill(15),
-            agility=get_skill(16),
-            thieving=get_skill(17),
-            slayer=get_skill(18),
-            farming=get_skill(19),
-            runecrafting=get_skill(20),
-            hunter=get_skill(21),
-            construction=get_skill(22),
-            summoning=get_skill(23),
-            dungeoneering=get_skill(24),
-            divination=get_skill(25),
-            invention=get_skill(26),
-            archaeology=get_skill(27),
-        )
-
-    @classmethod
-    async def from_text(cls, data: str):
-        order = [
-            "Overall",
-            "Attack",
-            "Defence",
-            "Strength",
-            "Hitpoints",
-            "Ranged",
-            "Prayer",
-            "Magic",
-            "Cooking",
-            "Woodcutting",
-            "Fletching",
-            "Fishing",
-            "Firemaking",
-            "Crafting",
-            "Smithing",
-            "Mining",
-            "Herblore",
-            "Agility",
-            "Thieving",
-            "Slayer",
-            "Farming",
-            "Runecrafting",
-            "Hunter",
-            "Construction",
-            "Bounty Hunter - Hunter",
-            "Bounty Hunter - Rogues",
-            "Clue Scrolls All",
-            "Clue Scrolls Easy",
-            "Clue Scrolls Medium",
-            "Clue Scrolls Hard",
-            "Clue Scrolls Elite",
-            "Clue Scrolls Master",
-            "LMS Rank",
-        ]
+    async def get_stats_table(self) -> str:
         skills_list = []
-        for line in enumerate(data.decode().split("\n")):
-            try:
-                xp = line[1].split(",")[2]
-                rank = line[1].split(",")[0]
-                level = line[1].split(",")[1]
-                skills_list.append([order[line[0]], level, xp, rank])
-            except Exception:
-                pass
-        return tabulate(
-            skills_list, headers=["Skill", "Level", "Experience", "Rank"], tablefmt="orgtbl"
-        )
+        for skill in self.skills.values():
+            skill_level = skill.level
+            if skill.level != skill.virtual_level and skill.id != 0:
+                skill_level = f"{skill.level} ({skill.virtual_level})"
+            skills_list.append(
+                [
+                    skill.name,
+                    skill_level,
+                    humanize_number(skill.xp),
+                    humanize_number(skill.rank),
+                ]
+            )
+        table = tabulate(skills_list, headers=["Skill", "Level", "Experience", "Rank"])
+        top_row_len = len(table.split("\n")[1])
+        top_row = top_row_len * "-"
+        title = f"{self.instance.to_str} For {self.name}"
+        skills = f"{top_row}\n"
+        for page in pagify(title, delims=[" "], page_length=top_row_len - 2):
+            skills += f"|{page.center(top_row_len - 2)}|\n"
+        skills += f"{top_row}\n{table}\n{top_row}"
+        return skills
+
+    async def get_profile_table(self) -> str:
+        activities_list = []
+        for activity in self.activities.values():
+            activities_list.append([activity.name, humanize_number(activity.score)])
+        table = tabulate(activities_list, headers=["Activity", "Completed"])
+        top_row_len = len(table.split("\n")[1])
+        top_row = top_row_len * "-"
+        title = f"{self.instance.to_str} For {self.name}"
+        skills = f"{top_row}\n"
+        for page in pagify(title, delims=[" "], page_length=top_row_len - 2):
+            skills += f"|{page.center(top_row_len - 2)}|\n"
+        skills += f"{top_row}\n{table}\n{top_row}"
+        return skills

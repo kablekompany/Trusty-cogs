@@ -1,31 +1,25 @@
-import logging
 import re
 from typing import Pattern, Union
 
 import discord
-from discord.ext.commands.converter import IDConverter, InviteConverter
+from discord.ext.commands.converter import IDConverter
 from discord.ext.commands.errors import BadArgument
+from discord.utils import resolve_invite
+from red_commons.logging import getLogger
 from redbot.core import Config, VersionInfo, commands, version_info
 from redbot.core.i18n import Translator
 from redbot.core.utils.chat_formatting import humanize_list, pagify
 
-log = logging.getLogger("red.trusty-cogs.inviteblocklist")
+log = getLogger("red.trusty-cogs.inviteblocklist")
 
 _ = Translator("ExtendedModLog", __file__)
 
 INVITE_RE: Pattern = re.compile(
-    r"(?:https?\:\/\/)?discord(?:\.gg|(?:app)?\.com\/invite)\/(.+)", re.I
+    r"(?:https?\:\/\/)?discord(?:\.gg|(?:app)?\.com\/invite)\/[^/\W]+", re.I
 )
-# https://github.com/Rapptz/discord.py/blob/master/discord/utils.py#L448
-
-
-class ValidServerID(IDConverter):
-    async def convert(self, ctx: commands.Context, argument: str):
-        match = self._get_id_match(argument)
-        if not match:
-            raise BadArgument("The ID provided does not appear to be valid.")
-        guild_id = int(match.group(1))
-        return guild_id
+# https://github.com/Rapptz/discord.py/blob/9806aeb83179d0d1e90d903e30db7e69e0d492e5/discord/utils.py#L887
+# Slightly modified to ignore whitespace characters in the event multiple invite links
+# are in the same message
 
 
 class ChannelUserRole(IDConverter):
@@ -77,9 +71,8 @@ class ChannelUserRole(IDConverter):
 
 
 class InviteBlocklist(commands.Cog):
-
     __author__ = ["TrustyJAID"]
-    __version__ = "1.1.3"
+    __version__ = "1.1.6"
 
     def __init__(self, bot):
         self.bot = bot
@@ -110,10 +103,12 @@ class InviteBlocklist(commands.Cog):
         """
         Handle messages edited with links
         """
+        if not payload.guild_id:
+            return
         if payload.cached_message:
             guild = payload.cached_message.guild
         else:
-            guild = self.bot.get_guild(int(payload.data["guild_id"]))
+            guild = self.bot.get_guild(int(payload.guild_id))
         if guild is None:
             return
         chan = guild.get_channel(payload.channel_id)
@@ -123,12 +118,22 @@ class InviteBlocklist(commands.Cog):
             if await self.bot.cog_disabled_in_guild(self, guild):
                 return
         guild_settings = await self.config.guild(guild).all()
-        if guild_settings["blacklist"] or guild_settings["whitelist"] or guild_settings["all_invites"]:
-            try:
-                msg = await chan.fetch_message(payload.message_id)
-            except (discord.errors.Forbidden, discord.errors.NotFound):
-                return
-            await self._handle_message_search(msg)
+        if (
+            guild_settings["blacklist"]
+            or guild_settings["whitelist"]
+            or guild_settings["all_invites"]
+        ):
+            if payload.cached_message is not None:
+                await self._handle_message_search(payload.cached_message)
+            else:
+                if "edited_timestamp" not in payload.data:
+                    # This should only be happening on links posted by users
+                    return
+                msg = discord.Message(state=chan._state, channel=chan, data=payload.data)
+                # construct the message object regardless of cache state
+                # d.py will normally ignore these edits and not build the full object
+                # so we manually construct it here for simplicity
+                await self._handle_message_search(msg)
 
     async def check_immunity_list(self, message: discord.Message) -> bool:
         is_immune = False
@@ -144,7 +149,7 @@ class InviteBlocklist(commands.Cog):
         if immunity_list:
             if channel.id in immunity_list:
                 is_immune = True
-            if channel.category_id and channel.category_id in immunity_list:
+            if getattr(channel, "category_id", None) in immunity_list:
                 is_immune = True
             if message.author.id in immunity_list:
                 is_immune = True
@@ -162,72 +167,95 @@ class InviteBlocklist(commands.Cog):
             if await self.bot.cog_disabled_in_guild(self, message.guild):
                 return
         if await self.check_immunity_list(message) is True:
-            log.debug("Message context is immune from invite blocklist")
+            log.debug("%r is immune from invite blocklist", message)
             return
         find = INVITE_RE.findall(message.clean_content)
         guild = message.guild
-        if find and await self.config.guild(message.guild).all_invites():
+        error_message = (
+            "There was an error fetching a potential invite link. "
+            f"The server ID could not be obtained so message ID {repr(message)} "
+            "may not have been properly deleted."
+        )
+        if guild is None:
+            return
+        if find and await self.config.guild(guild).all_invites():
             try:
                 await message.delete()
             except discord.errors.Forbidden:
                 log.error(
-                    _(
-                        "I tried to delete an invite link posted in {guild} "
-                        "but lacked the permission to do so"
-                    ).format(guild=guild.name)
+                    "I tried to delete an invite link posted in %r "
+                    "but lack the manage messages permission.",
+                    message.channel,
                 )
             return
-        if whitelist := await self.config.guild(message.guild).whitelist():
+        if whitelist := await self.config.guild(guild).whitelist():
             for i in find:
-                invite = await self.bot.fetch_invite(i)
-                if invite.guild.id == message.guild.id:
+                inv = resolve_invite(i)
+                try:
+                    invite = await self.bot.fetch_invite(inv.code)
+                except discord.errors.NotFound:
+                    log.error(error_message)
+                    continue
+                except Exception:
+                    log.exception(error_message)
+                    continue
+                if invite.guild.id == guild.id:
                     continue
                 if invite.guild.id not in whitelist:
                     try:
                         await message.delete()
                     except discord.errors.Forbidden:
                         log.error(
-                            _(
-                                "I tried to delete an invite link posted in {guild} "
-                                "but lacked the permission to do so"
-                            ).format(guild=guild.name)
+                            "I tried to delete an invite link posted in %r "
+                            "but lack the manage messages permission.",
+                            message.channel,
                         )
                     return
             return
-        if blacklist := await self.config.guild(message.guild).blacklist():
+        if blacklist := await self.config.guild(guild).blacklist():
             for i in find:
-                invite = await self.bot.fetch_invite(i)
-                if invite.guild.id == message.guild.id:
+                inv = resolve_invite(i)
+                try:
+                    invite = await self.bot.fetch_invite(inv.code)
+                except discord.errors.NotFound:
+                    log.error(error_message)
+                    continue
+                except Exception:
+                    log.exception(error_message)
+                    continue
+                if invite.guild.id == guild.id:
                     continue
                 if invite.guild.id in blacklist:
                     try:
                         await message.delete()
                     except discord.errors.Forbidden:
                         log.error(
-                            _(
-                                "I tried to delete an invite link posted in {guild} "
-                                "but lacked the permission to do so"
-                            ).format(guild=guild.name)
+                            "I tried to delete an invite link posted in %r "
+                            "but lack the manage messages permission.",
+                            message.channel,
                         )
                     return
             return
 
     @commands.group(name="inviteblock", aliases=["ibl", "inviteblocklist"])
     @commands.mod_or_permissions(manage_messages=True)
+    @commands.guild_only()
     async def invite_block(self, ctx: commands.Context):
         """
         Settings for managing invite link blocking
         """
         pass
 
-    @invite_block.group(name="blocklist", aliases=["blacklist", "bl"])
+    @invite_block.group(name="blocklist", aliases=["blacklist", "bl", "block"])
+    @commands.guild_only()
     async def invite_blocklist(self, ctx: commands.Context):
         """
         Commands for setting the blocklist
         """
         pass
 
-    @invite_block.group(name="allowlist", aliases=["whitelist", "wl", "al"])
+    @invite_block.group(name="allowlist", aliases=["whitelist", "wl", "al", "allow"])
+    @commands.guild_only()
     async def invite_allowlist(self, ctx: commands.Context):
         """
         Commands for setting the blocklist
@@ -235,6 +263,7 @@ class InviteBlocklist(commands.Cog):
         pass
 
     @invite_block.group(name="immunity", aliases=["immune"])
+    @commands.guild_only()
     async def invite_immunity(self, ctx: commands.Context):
         """
         Commands for fine tuning allowed channels, users, or roles
@@ -264,7 +293,9 @@ class InviteBlocklist(commands.Cog):
 
     @invite_blocklist.command(name="add")
     async def add_to_blocklist(
-        self, ctx: commands.Context, *invite_or_guild_id: Union[InviteConverter, ValidServerID]
+        self,
+        ctx: commands.Context,
+        *invite_or_guild_id: Union[discord.Invite, discord.Guild, int],
     ):
         """
         Add a guild ID to the blocklist, providing an invite link will also work
@@ -279,12 +310,12 @@ class InviteBlocklist(commands.Cog):
                     if i not in blacklist:
                         blacklist.append(i)
                         guilds_blocked.append(str(i))
-                if isinstance(i, discord.Invite):
+                elif isinstance(i, discord.Invite):
                     if i.guild and i.guild.id not in blacklist:
-                        blacklist.append(i.guild.id)
                         guilds_blocked.append(f"{i.guild.name} - {i.guild.id}")
-                else:
-                    if i.id in blacklist:
+                        blacklist.append(i.guild.id)
+                elif isinstance(i, discord.Guild):
+                    if i.id not in blacklist:
                         guilds_blocked.append(f"{i.name} - {i.id}")
                         blacklist.append(i.id)
         if guilds_blocked:
@@ -294,11 +325,11 @@ class InviteBlocklist(commands.Cog):
         else:
             await ctx.send(_("None of the provided invite links or guild ID's are new."))
 
-    @invite_blocklist.group(name="remove", aliases=["del", "rem"])
+    @invite_blocklist.command(name="remove", aliases=["del", "rem"])
     async def remove_from_blocklist(
         self,
         ctx: commands.Context,
-        *thing_to_block: Union[InviteConverter, ValidServerID],
+        *thing_to_block: Union[discord.Invite, discord.Guild, int],
     ):
         """
         Add a guild ID to the blocklist, providing an invite link will also work
@@ -313,11 +344,11 @@ class InviteBlocklist(commands.Cog):
                     if i in blacklist:
                         blacklist.remove(i)
                         guilds_blocked.append(str(i))
-                if isinstance(i, discord.Invite):
+                elif isinstance(i, discord.Invite):
                     if i.guild and i.guild.id in blacklist:
                         guilds_blocked.append(f"{i.guild.name} - {i.guild.id}")
                         blacklist.remove(i.guild.id)
-                else:
+                elif isinstance(i, discord.Guild):
                     if i.id in blacklist:
                         guilds_blocked.append(f"{i.name} - {i.id}")
                         blacklist.remove(i.id)
@@ -353,7 +384,9 @@ class InviteBlocklist(commands.Cog):
 
     @invite_allowlist.command(name="add")
     async def add_to_allowlist(
-        self, ctx: commands.Context, *invite_or_guild_id: Union[InviteConverter, ValidServerID]
+        self,
+        ctx: commands.Context,
+        *invite_or_guild_id: Union[discord.Invite, discord.Guild, int],
     ):
         """
         Add a guild ID to the allowlist, providing an invite link will also work
@@ -368,10 +401,14 @@ class InviteBlocklist(commands.Cog):
                     if i not in whitelist:
                         whitelist.append(i)
                         guilds_blocked.append(str(i))
-                else:
+                elif isinstance(i, discord.Invite):
                     if i.guild and i.guild.id not in whitelist:
-                        whitelist.append(i.guild.id)
                         guilds_blocked.append(f"{i.guild.name} - {i.guild.id}")
+                        whitelist.append(i.guild.id)
+                elif isinstance(i, discord.Guild):
+                    if i.id not in whitelist:
+                        guilds_blocked.append(f"{i.name} - {i.id}")
+                        whitelist.append(i.id)
         if guilds_blocked:
             await ctx.send(
                 _("Now Allowing invites from {guild}.").format(guild=humanize_list(guilds_blocked))
@@ -381,7 +418,9 @@ class InviteBlocklist(commands.Cog):
 
     @invite_allowlist.command(name="remove", aliases=["del", "rem"])
     async def remove_from_allowlist(
-        self, ctx: commands.Context, *invite_or_guild_id: Union[InviteConverter, ValidServerID]
+        self,
+        ctx: commands.Context,
+        *invite_or_guild_id: Union[discord.Invite, discord.Guild, int],
     ):
         """
         Add a guild ID to the allowlist, providing an invite link will also work
@@ -396,10 +435,14 @@ class InviteBlocklist(commands.Cog):
                     if i in whitelist:
                         whitelist.remove(i)
                         guilds_blocked.append(str(i))
-                else:
+                elif isinstance(i, discord.Invite):
                     if i.guild and i.guild.id in whitelist:
                         guilds_blocked.append(f"{i.guild.name} - {i.guild.id}")
                         whitelist.remove(i.guild.id)
+                elif isinstance(i, discord.Guild):
+                    if i.id in whitelist:
+                        guilds_blocked.append(f"{i.name} - {i.id}")
+                        whitelist.remove(i.id)
         if guilds_blocked:
             await ctx.send(
                 _("Removed {guild} from allowlist.").format(guild=humanize_list(guilds_blocked))
@@ -437,9 +480,11 @@ class InviteBlocklist(commands.Cog):
         self, ctx: commands.Context, *channel_user_role: ChannelUserRole
     ):
         """
-        Add a guild ID to the allowlist, providing an invite link will also work
+        Add a channel, user, or role to the immunity list.
+        Any invite links posted in these channels, by users with this role, or users added
+        to this list will not have messages with invite links deleted.
 
-        `[channel_user_role...]` is the channel, user or role to whitelist
+        `[channel_user_role...]` is the channel, user or role to make immune.
         (You can supply more than one of any at a time)
         """
         if len(channel_user_role) < 1:
@@ -459,9 +504,11 @@ class InviteBlocklist(commands.Cog):
         self, ctx: commands.Context, *channel_user_role: ChannelUserRole
     ):
         """
-        Add a guild ID to the allowlist, providing an invite link will also work
+        remove a channel, user, or role from the immunity list.
+        Any invite links posted in these channels, by users with this role, or users added
+        to immunity will not have messages with invite links deleted.
 
-        `[channel_user_role...]` is the channel, user or role to remove from the whitelist
+        `[channel_user_role...]` is the channel, user or role to remove from the immunity list
         (You can supply more than one of any at a time)
         """
         if len(channel_user_role) < 1:
@@ -479,7 +526,7 @@ class InviteBlocklist(commands.Cog):
     @invite_immunity.command(name="info")
     async def allowlist_context_info(self, ctx: commands.Context):
         """
-        Show what channels, users, and roles are in the invite link allowlist
+        Show what channels, users, and roles are immune to inviteblocklist
         """
         msg = _("Invite immunity list for {guild}:\n").format(guild=ctx.guild.name)
         whitelist = await self.config.guild(ctx.guild).immunity_list()

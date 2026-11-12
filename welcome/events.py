@@ -1,21 +1,20 @@
-import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from random import choice as rand_choice
 from typing import List, Optional, Pattern, Union, cast
 
 import discord
+from red_commons.logging import getLogger
 from redbot import VersionInfo, version_info
 from redbot.core import Config, commands
 from redbot.core.bot import Red
 from redbot.core.i18n import Translator, cog_i18n
 from redbot.core.utils.chat_formatting import humanize_list
-from redbot.core.utils.common_filters import filter_mass_mentions
 
 RE_CTX: Pattern = re.compile(r"{([^}]+)\}")
 RE_POS: Pattern = re.compile(r"{((\d+)[^.}]*(\.[^:}]+)?[^}]*)\}")
 _ = Translator("Welcome", __file__)
-log = logging.getLogger("red.trusty-cogs.Welcome")
+log = getLogger("red.trusty-cogs.Welcome")
 
 
 @cog_i18n(_)
@@ -49,9 +48,7 @@ class Events:
         user_count = self.today_count[guild.id] if guild.id in self.today_count else 1
         raw_response = raw_response.replace("{count}", str(user_count))
         has_filter = self.bot.get_cog("Filter")
-        filter_setting = await self.config.guild(guild).FILTER_SETTING()
-        if filter_setting is None:
-            filter_setting = "[Redacted]"
+        filter_setting = await self.config.guild(guild).FILTER_SETTING() or "[Redacted]"
         if isinstance(member, list):
             username = humanize_list(member)
         else:
@@ -72,7 +69,10 @@ class Events:
                         param = params[0]
             raw_response = raw_response.replace("{" + result[0] + "}", param)
         if has_filter:
-            bad_name = await has_filter.filter_hits(username, guild)
+            if version_info < VersionInfo.from_str("3.5.10"):
+                bad_name = await has_filter.filter_hits(username, guild)
+            else:
+                bad_name = await has_filter.filter_hits(guild, username)
             if bad_name:
                 for word in bad_name:
                     raw_response = re.sub(rf"(?i){word}", filter_setting, raw_response)
@@ -102,13 +102,21 @@ class Events:
         has_filter = self.bot.get_cog("Filter")
         username = str(member)
         if has_filter:
-            bad_words = await has_filter.filter_hits(username, guild)
+            replace_word = await self.config.guild(guild).FILTER_SETTING() or "[Redacted]"
+            if version_info < VersionInfo.from_str("3.5.10"):
+                bad_words = await has_filter.filter_hits(username, guild)
+            else:
+                bad_words = await has_filter.filter_hits(guild, username)
             if bad_words:
                 for word in bad_words:
-                    username = username.replace(word, "[Redacted]")
-        em = discord.Embed(description=converted_msg)
-        if EMBED_DATA["colour"]:
-            em.colour = EMBED_DATA["colour"]
+                    username = username.replace(word, replace_word)
+        em = discord.Embed(description=converted_msg[:4096])
+        colour = EMBED_DATA.get("colour", 0)
+        goodbye_colour = EMBED_DATA.get("colour_goodbye", 0)
+        em.colour = colour
+        if not is_welcome:
+            em.colour = goodbye_colour or colour
+
         if EMBED_DATA["title"]:
             em.title = await self.convert_parms(member, guild, EMBED_DATA["title"], False)
         if EMBED_DATA["footer"]:
@@ -118,11 +126,11 @@ class Events:
         if EMBED_DATA["thumbnail"]:
             url = EMBED_DATA["thumbnail"]
             if url == "guild":
-                url = str(guild.icon_url)
+                url = str(guild.icon.url) if guild.icon else ""
             elif url == "splash":
-                url = str(guild.splash_url)
-            elif url == "avatar" and isinstance(member, discord.Member):
-                url = str(member.avatar_url)
+                url = str(guild.splash) if guild.splash else ""
+            elif url == "avatar":
+                url = str(member.display_avatar) if isinstance(member, discord.Member) else ""
             em.set_thumbnail(url=url)
         if EMBED_DATA["image"] or EMBED_DATA["image_goodbye"]:
             url = ""
@@ -131,52 +139,70 @@ class Events:
             if EMBED_DATA["image_goodbye"] and not is_welcome:
                 url = EMBED_DATA["image_goodbye"]
             if url == "guild":
-                url = str(guild.icon_url)
+                url = str(guild.icon.url) if guild.icon else ""
             elif url == "splash":
-                url = str(guild.splash_url)
-            elif url == "avatar" and isinstance(member, discord.Member):
-                url = str(member.avatar_url)
+                url = str(guild.splash) if guild.splash else ""
+            elif url == "avatar":
+                url = str(member.display_avatar) if isinstance(member, discord.Member) else ""
             em.set_image(url=url)
         if EMBED_DATA["icon_url"]:
             url = EMBED_DATA["icon_url"]
             if url == "guild":
-                url = str(guild.icon_url)
+                url = str(guild.icon.url) if guild.icon else ""
             elif url == "splash":
-                url = str(guild.splash_url)
-            elif url == "avatar" and isinstance(member, discord.Member):
-                url = str(member.avatar_url)
+                url = str(guild.splash) if guild.splash else ""
+            elif url == "avatar":
+                url = str(member.display_avatar) if isinstance(member, discord.Member) else ""
             em.set_author(name=username, icon_url=url)
         if EMBED_DATA["timestamp"]:
-            em.timestamp = datetime.utcnow()
+            em.timestamp = datetime.now(timezone.utc)
         if EMBED_DATA["author"] and isinstance(member, discord.Member):
-            em.set_author(name=username, icon_url=str(member.avatar_url))
+            em.set_author(name=username, icon_url=str(member.display_avatar))
         return em
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member) -> None:
         guild = member.guild
+        if await self.config.guild(guild).PENDING() and member.pending:
+            log.debug("Ignoring member join %r to wait for pending", member)
+            return
+        await self.check_member_join(member)
+
+    @commands.Cog.listener()
+    async def on_member_update(self, before: discord.Member, after: discord.Member):
+        guild = after.guild
+        if await self.config.guild(guild).PENDING():
+            if before.pending != after.pending:
+                await self.check_member_join(after)
+
+    async def check_member_join(self, member: discord.Member):
+        guild = member.guild
         if not await self.config.guild(guild).ON():
             return
         if guild is None:
             return
-        if version_info >= VersionInfo.from_str("3.4.0"):
-            if await self.bot.cog_disabled_in_guild(self, guild):
-                return
-        if member.bot:
+        if await self.bot.cog_disabled_in_guild(self, guild):
+            return
+        if member.bot and await self.config.guild(guild).BOTS_MSG() is not None:
             return await self.bot_welcome(member, guild)
         td = timedelta(days=await self.config.guild(guild).MINIMUM_DAYS())
-        if (datetime.utcnow() - member.created_at) <= td:
-            log.info(_("Member joined with an account newer than required days."))
+        if (datetime.now(timezone.utc) - member.created_at) <= td:
+            log.info("Member joined with an account newer than required days.")
             return
         has_filter = self.bot.get_cog("Filter")
         filter_setting = await self.config.guild(guild).FILTER_SETTING()
         if has_filter and filter_setting is None:
-            if await has_filter.filter_hits(member.name, guild):
-                log.info(_("Member joined with a bad username."))
-                return
+            if version_info < VersionInfo.from_str("3.5.10"):
+                if await has_filter.filter_hits(member.name, guild):
+                    log.info("Member joined with a bad username.")
+                    return
+            else:
+                if await has_filter.filter_hits(guild, member.name):
+                    log.info("Member joined with a bad username.")
+                    return
 
-        if datetime.utcnow().date() > self.today_count["now"].date():
-            self.today_count = {"now": datetime.utcnow()}
+        if datetime.now(timezone.utc).date() > self.today_count["now"].date():
+            self.today_count = {"now": datetime.now(timezone.utc)}
             # reset the daily count when a user joins the following day or when the cog is reloaded
 
         if guild.id not in self.today_count:
@@ -198,11 +224,8 @@ class Events:
         msg = bot_welcome or rand_choice(await self.config.guild(guild).GREETING())
         channel = await self.get_welcome_channel(member, guild)
         is_embed = await self.config.guild(guild).EMBED()
-        if version_info >= VersionInfo.from_str("3.4.0"):
-            mentions = await self.config.guild(guild).MENTIONS()
-            sanitize = {"allowed_mentions": discord.AllowedMentions(**mentions)}
-        else:
-            sanitize = {}
+        mentions = await self.config.guild(guild).MENTIONS()
+        allowed_mentions = discord.AllowedMentions(**mentions)
 
         if bot_role:
             try:
@@ -210,13 +233,13 @@ class Events:
                 await member.add_roles(role, reason=_("Automatic Bot Role"))
             except Exception:
                 log.error(
-                    _("welcome.py: unable to add  a role. ") + f"{bot_role} {member}",
+                    "welcome.py: unable to add  a role. %s %s",
+                    bot_role,
+                    member,
                     exc_info=True,
                 )
             else:
-                log.debug(
-                    _("welcome.py: added ") + str(role) + _(" role to ") + _("bot, ") + str(member)
-                )
+                log.debug("welcome.py: added %s role to bot, %s", role, member)
         if bot_welcome:
             # finally, welcome them
             if not channel:
@@ -224,12 +247,13 @@ class Events:
             if is_embed and channel.permissions_for(guild.me).embed_links:
                 em = await self.make_embed(member, guild, msg, False)
                 if await self.config.guild(guild).EMBED_DATA.mention():
-                    await channel.send(member.mention, embed=em, **sanitize)
+                    await channel.send(member.mention, embed=em, allowed_mentions=allowed_mentions)
                 else:
-                    await channel.send(embed=em)
+                    await channel.send(embed=em, allowed_mentions=allowed_mentions)
             else:
                 await channel.send(
-                    await self.convert_parms(member, guild, bot_welcome, False), **sanitize
+                    await self.convert_parms(member, guild, bot_welcome, False),
+                    allowed_mentions=allowed_mentions,
                 )
 
     async def get_welcome_channel(
@@ -243,8 +267,8 @@ class Events:
         if channel is None:  # complain even if only whisper
             if not only_whisper:
                 log.info(
-                    _("welcome.py: Channel not found. It was most likely deleted. User joined: ")
-                    + str(member)
+                    "welcome.py: Channel not found. It was most likely deleted. User joined: %s",
+                    member,
                 )
                 return None
             else:
@@ -252,11 +276,12 @@ class Events:
                 return None
         # we can stop here
 
-        if not guild.me.permissions_in(channel).send_messages:
-            log.info(_("Permissions Error. User that joined: ") + "{0}".format(member))
+        if not channel.permissions_for(guild.me).send_messages:
+            log.info("Permissions Error. User that joined: %s", member)
             log.info(
-                _("Bot doesn't have permissions to send messages to ")
-                + "{0.name}'s #{1.name} channel".format(guild, channel)
+                "Bot doesn't have permissions to send messages to %s's $%s",
+                guild.name,
+                channel.name,
             )
             return None
         return channel
@@ -266,15 +291,15 @@ class Events:
     ) -> None:
         only_whisper = await self.config.guild(guild).WHISPER() is True
         channel = await self.get_welcome_channel(member, guild)
-        msg = rand_choice(await self.config.guild(guild).GREETING())
+        msgs = await self.config.guild(guild).GREETING()
+        if not msgs:
+            return
+        msg = rand_choice(msgs)
         is_embed = await self.config.guild(guild).EMBED()
         delete_after = await self.config.guild(guild).DELETE_AFTER_GREETING()
         save_msg = None
-        if version_info >= VersionInfo.from_str("3.4.0"):
-            mentions = await self.config.guild(guild).MENTIONS()
-            sanitize = {"allowed_mentions": discord.AllowedMentions(**mentions)}
-        else:
-            sanitize = {}
+        mentions = await self.config.guild(guild).MENTIONS()
+        allowed_mentions = discord.AllowedMentions(**mentions)
 
         if await self.config.guild(guild).DELETE_PREVIOUS_GREETING():
             old_id = await self.config.guild(guild).LAST_GREETING()
@@ -302,11 +327,8 @@ class Events:
                         await member.send(await self.convert_parms(member, guild, msg, False))  # type: ignore
                 except discord.errors.Forbidden:
                     log.info(
-                        _(
-                            "welcome.py: unable to whisper a user. Probably "
-                            "doesn't want to be PM'd"
-                        )
-                        + str(member)
+                        "welcome.py: unable to whisper %s. Probably doesn't want to be PM'd",
+                        member,
                     )
                 except Exception:
                     log.error("error sending member join message", exc_info=True)
@@ -323,7 +345,7 @@ class Events:
                         humanize_list([m.mention for m in members]),
                         embed=em,
                         delete_after=delete_after,
-                        **sanitize,
+                        allowed_mentions=allowed_mentions,
                     )
                 else:
                     member = cast(discord.Member, member)
@@ -331,19 +353,19 @@ class Events:
                         str(member.mention),
                         embed=em,
                         delete_after=delete_after,
-                        **sanitize,
+                        allowed_mentions=allowed_mentions,
                     )
             else:
                 save_msg = await channel.send(
                     embed=em,
                     delete_after=delete_after,
-                    **sanitize,
+                    allowed_mentions=allowed_mentions,
                 )
         else:
             save_msg = await channel.send(
                 await self.convert_parms(member, guild, msg, True),
                 delete_after=delete_after,
-                **sanitize,
+                allowed_mentions=allowed_mentions,
             )
         if save_msg is not None:
             await self.config.guild(guild).LAST_GREETING.set(save_msg.id)
@@ -354,9 +376,8 @@ class Events:
         if guild is None:
             return
 
-        if version_info >= VersionInfo.from_str("3.4.0"):
-            if await self.bot.cog_disabled_in_guild(self, guild):
-                return
+        if await self.bot.cog_disabled_in_guild(self, guild):
+            return
         if await self.config.guild(guild).GROUPED():
             if guild.id not in self.joined:
                 self.joined[guild.id] = []
@@ -365,27 +386,24 @@ class Events:
 
         if not await self.config.guild(guild).LEAVE_ON():
             return
-
-        bot_welcome = member.bot and await self.config.guild(guild).BOTS_MSG()
-        msg = bot_welcome or rand_choice(await self.config.guild(guild).GOODBYE())
+        if member.bot and await self.config.guild(guild).BOTS_GOODBYE_MSG():
+            await self.bot_leave(member, guild)
+            return
+        msgs = await self.config.guild(guild).GOODBYE()
+        if not msgs:
+            return
+        msg = rand_choice(msgs)
         is_embed = await self.config.guild(guild).EMBED()
         delete_after = await self.config.guild(guild).DELETE_AFTER_GOODBYE()
         save_msg = None
-        if version_info >= VersionInfo.from_str("3.4.0"):
-            mentions = await self.config.guild(guild).GOODBYE_MENTIONS()
-            sanitize = {"allowed_mentions": discord.AllowedMentions(**mentions)}
-        else:
-            sanitize = {}
+        mentions = await self.config.guild(guild).GOODBYE_MENTIONS()
+        allowed_mentions = discord.AllowedMentions(**mentions)
 
         # grab the welcome channel
         # guild_settings = await self.config.guild(guild).guild_settings()
         channel = self.bot.get_channel(await self.config.guild(guild).LEAVE_CHANNEL())
         if channel is None:  # complain even if only whisper
-            log.info(
-                _("welcome.py: Channel not found in {guild}. It was most likely deleted.").format(
-                    guild=guild
-                )
-            )
+            log.debug("welcome.py: Channel not found in %s. It was most likely deleted.", guild)
             return
         # we can stop here
         if await self.config.guild(guild).DELETE_PREVIOUS_GOODBYE():
@@ -403,25 +421,53 @@ class Events:
                     await old_msg.delete()
 
         if not channel.permissions_for(guild.me).send_messages:
-            log.info(_("Permissions Error in {guild}"))
+            log.info("Permissions Error in {guild}")
             return
         elif not member.bot:
             if is_embed and channel.permissions_for(guild.me).embed_links:
                 em = await self.make_embed(member, guild, msg, False)
                 if await self.config.guild(guild).EMBED_DATA.mention():
                     save_msg = await channel.send(
-                        member.mention, embed=em, delete_after=delete_after, **sanitize
+                        member.mention,
+                        embed=em,
+                        delete_after=delete_after,
+                        allowed_mentions=allowed_mentions,
                     )
                 else:
-                    save_msg = await channel.send(embed=em, delete_after=delete_after)
+                    save_msg = await channel.send(
+                        embed=em, delete_after=delete_after, allowed_mentions=allowed_mentions
+                    )
             else:
                 save_msg = await channel.send(
                     await self.convert_parms(member, guild, msg, False),
                     delete_after=delete_after,
-                    **sanitize,
+                    allowed_mentions=allowed_mentions,
                 )
         if save_msg is not None:
             await self.config.guild(guild).LAST_GOODBYE.set(save_msg.id)
+
+    async def bot_leave(self, member: discord.Member, guild: discord.Guild):
+        bot_welcome = await self.config.guild(guild).BOTS_GOODBYE_MSG()
+        msg = bot_welcome or rand_choice(await self.config.guild(guild).GOODBYE())
+        channel = self.bot.get_channel(await self.config.guild(guild).LEAVE_CHANNEL())
+        if channel is None:
+            return
+        is_embed = await self.config.guild(guild).EMBED()
+        mentions = await self.config.guild(guild).MENTIONS()
+        allowed_mentions = discord.AllowedMentions(**mentions)
+        if bot_welcome:
+            # finally, welcome them
+            if is_embed and channel.permissions_for(guild.me).embed_links:
+                em = await self.make_embed(member, guild, msg, False)
+                if await self.config.guild(guild).EMBED_DATA.mention():
+                    await channel.send(member.mention, embed=em, allowed_mentions=allowed_mentions)
+                else:
+                    await channel.send(embed=em, allowed_mentions=allowed_mentions)
+            else:
+                await channel.send(
+                    await self.convert_parms(member, guild, bot_welcome, False),
+                    allowed_mentions=allowed_mentions,
+                )
 
     async def send_testing_msg(
         self, ctx: commands.Context, bot: bool = False, msg: str = None, leave: bool = False
@@ -430,22 +476,22 @@ class Events:
         default_greeting = "Welcome {0.name} to {1.name}!"
         default_goodbye = "See you later {0.name}!"
         default_bot_msg = "Hello {0.name}, fellow bot!"
-        guild = ctx.message.guild
+        guild = cast(discord.Guild, ctx.message.guild)
         guild_settings = await self.config.guild(guild).get_raw()
         # log.info(guild_settings)
-        if version_info >= VersionInfo.from_str("3.4.0"):
-            mentions = await self.config.guild(guild).MENTIONS()
-            sanitize = {"allowed_mentions": discord.AllowedMentions(**mentions)}
-        else:
-            sanitize = {}
+        mentions = await self.config.guild(guild).MENTIONS()
+        allowed_mentions = discord.AllowedMentions(**mentions)
         channel = guild.get_channel(guild_settings["CHANNEL"])
         if leave:
             channel = guild.get_channel(guild_settings["LEAVE_CHANNEL"])
-        rand_msg = msg or rand_choice(guild_settings["GREETING"])
+        choices = guild_settings["GREETING"] or [default_greeting]
+
         if leave:
-            rand_msg = msg or rand_choice(guild_settings["GOODBYE"])
-        if bot:
+            choices = guild_settings["GOODBYE"] or [default_goodbye]
+        rand_msg = rand_choice(choices)
+        if bot and guild_settings["BOTS_MSG"]:
             rand_msg = guild_settings["BOTS_MSG"]
+
         if rand_msg is None and msg is None:
             rand_msg = default_greeting
         if rand_msg is None and bot:
@@ -454,18 +500,21 @@ class Events:
             rand_msg = default_goodbye
         is_welcome = not leave
         is_embed = guild_settings["EMBED"]
-        member = ctx.message.author
+        member = cast(discord.Member, ctx.message.author)
+        members = cast(List[discord.Member], [ctx.author, ctx.me])
         whisper_settings = guild_settings["WHISPER"]
         if channel is None and whisper_settings not in ["BOTH", True]:
             msg = _("I can't find the specified channel. It might have been deleted.")
             await ctx.send(msg)
             return
-        if channel is None:
-            await ctx.send(_("`Sending a testing message to ") + "` DM", **sanitize)
-        else:
-            await ctx.send(
-                _("`Sending a testing message to ") + "`{0.mention}".format(channel), **sanitize
-            )
+        msg = _("Sending test message to {location}. ").format(
+            location="DM" if channel is None else channel.mention
+        )
+        if not guild_settings["GREETING"] and not leave:
+            msg += _("Using default greeting because there are none saved.")
+        elif not guild_settings["GOODBYE"] and leave:
+            msg += _("Using default goodbye because there are none saved.")
+        await ctx.send(msg, allowed_mentions=allowed_mentions)
         if not bot and guild_settings["WHISPER"]:
             if is_embed:
                 em = await self.make_embed(member, guild, rand_msg, is_welcome)
@@ -474,29 +523,40 @@ class Events:
                 await ctx.author.send(
                     await self.convert_parms(member, guild, rand_msg, is_welcome),
                     delete_after=60,
-                    **sanitize,
+                    allowed_mentions=allowed_mentions,
                 )
             if guild_settings["WHISPER"] != "BOTH":
                 return
         if bot or whisper_settings is not True:
             if not channel:
                 return
-            if guild_settings["GROUPED"]:
-                member = [ctx.author, ctx.me]
+
             if is_embed and channel.permissions_for(guild.me).embed_links:
-                em = await self.make_embed(member, guild, rand_msg, is_welcome)
+                if guild_settings["GROUPED"]:
+                    em = await self.make_embed(members, guild, rand_msg, is_welcome)
+                    # only pass the list of members to simulate a grouped welcome
+                else:
+                    em = await self.make_embed(member, guild, rand_msg, is_welcome)
+
                 if await self.config.guild(guild).EMBED_DATA.mention():
                     if guild_settings["GROUPED"]:
                         await channel.send(
-                            humanize_list([m.mention for m in member]), embed=em, delete_after=60
+                            humanize_list([m.mention for m in members]), embed=em, delete_after=60
                         )
                     else:
-                        await channel.send(member.mention, embed=em, delete_after=60, **sanitize)
+                        await channel.send(
+                            member.mention,
+                            embed=em,
+                            delete_after=60,
+                            allowed_mentions=allowed_mentions,
+                        )
                 else:
-                    await channel.send(embed=em, delete_after=60, **sanitize)
+                    await channel.send(
+                        embed=em, delete_after=60, allowed_mentions=allowed_mentions
+                    )
             else:
                 await channel.send(
-                    await self.convert_parms(member, guild, rand_msg, is_welcome),
+                    await self.convert_parms(members, guild, rand_msg, is_welcome),
                     delete_after=60,
-                    **sanitize,
+                    allowed_mentions=allowed_mentions,
                 )

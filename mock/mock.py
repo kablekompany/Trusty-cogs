@@ -1,11 +1,11 @@
 import random
-import logging
 from typing import Optional, Union
 
 import discord
+from red_commons.logging import getLogger
 from redbot.core import commands
 
-log = logging.getLogger("red.trusty-cogs.mock")
+log = getLogger("red.trusty-cogs.mock")
 
 
 class Mock(commands.Cog):
@@ -57,12 +57,12 @@ class Mock(commands.Cog):
         the `channel` and put them all together
         """
         if isinstance(msg, str):
-            log.debug("Mocking a given string")
+            log.verbose("Mocking a given string")
             result = await self.cap_change(str(msg))
             result += f"\n\n[Mocking Message]({ctx.message.jump_url})"
             author = ctx.message.author
         elif isinstance(msg, discord.Member):
-            log.debug("Mocking a user")
+            log.verbose("Mocking a user")
             total_msg = ""
             async for message in ctx.channel.history(limit=10):
                 if message.author == msg:
@@ -70,13 +70,13 @@ class Mock(commands.Cog):
             result = await self.cap_change(total_msg)
             author = msg
         elif isinstance(msg, discord.Message):
-            log.debug("Mocking a message")
+            log.verbose("Mocking a message")
             result = await self.cap_change(msg.content)
             result += f"\n\n[Mocking Message]({msg.jump_url})"
             author = msg.author
             search_msg = msg
         else:
-            log.debug("Mocking last message in chat")
+            log.verbose("Mocking last message in chat")
             async for message in ctx.channel.history(limit=2):
                 search_msg = message
             author = search_msg.author
@@ -88,11 +88,11 @@ class Mock(commands.Cog):
         time = ctx.message.created_at
         embed = discord.Embed(description=result, timestamp=time)
         embed.colour = getattr(author, "colour", discord.Colour.default())
-        embed.set_author(name=author.display_name, icon_url=author.avatar_url)
+        embed.set_author(name=author.display_name, icon_url=author.display_avatar.url)
         embed.set_thumbnail(url="https://i.imgur.com/upItEiG.jpg")
         embed.set_footer(
             text=f"{ctx.message.author.display_name} mocked {author.display_name}",
-            icon_url=ctx.message.author.avatar_url,
+            icon_url=ctx.message.author.display_avatar.url,
         )
         if hasattr(msg, "attachments") and search_msg.attachments != []:
             embed.set_image(url=search_msg.attachments[0].url)

@@ -1,15 +1,14 @@
-import logging
-import apraw
 import re
+from typing import Dict, Optional, Union
 
-from typing import Optional, Union, Dict
-
-from redbot.core import commands
-from redbot.core.i18n import Translator
+import apraw
 import discord
+from apraw.models import Submission, Subreddit
 from discord.ext.commands.converter import Converter
 from discord.ext.commands.errors import BadArgument
-from apraw.models import Submission, Subreddit
+from red_commons.logging import getLogger
+from redbot.core import commands
+from redbot.core.i18n import Translator
 
 BASE_URL = "https://reddit.com"
 
@@ -17,7 +16,7 @@ SELF_POST_SCRUB = re.compile(r"^(&#x200B;[\s\n]+)(https?://.+)$")
 
 REDDIT_RE = re.compile(r"\/?r\/([a-zA-Z0-9_]+)")
 
-log = logging.getLogger("red.Trusty-cogs.reddit")
+log = getLogger("red.Trusty-cogs.reddit")
 
 _ = Translator("Reddit", __file__)
 
@@ -31,7 +30,7 @@ class SubredditConverter(Converter):
                     "Have them see `{prefix}redditset creds` for more information"
                 ).format(prefix=ctx.clean_prefix)
             )
-        await ctx.trigger_typing()
+        await ctx.typing()
         subr = REDDIT_RE.search(argument)
         if subr:
             subreddit = subr.group(1)
@@ -112,12 +111,12 @@ async def make_embed_from_submission(
             if data["e"] == "RedditVideo":
                 continue
             if data["e"] == "Image":
-                log.debug(data)
+                log.verbose("make_embed_from_submission Image data: %s", data)
                 has_image = True
                 em.set_image(url=data["s"]["u"])
                 break
             if data["e"] == "AnimatedImage":
-                log.debug(data)
+                log.verbose("make_embed_from_submission AnimatedImage data: %s", data)
                 has_image = True
                 em.set_image(url=data["s"]["gif"])
                 break

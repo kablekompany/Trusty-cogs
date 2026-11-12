@@ -1,16 +1,16 @@
 import datetime
-import logging
-from typing import Dict, Optional, Union, List
+from typing import Dict, List, Optional, Union
 
 import aiohttp
 import discord
+from red_commons.logging import getLogger
 from redbot.core import commands
 from redbot.core.bot import Red
 
 from .coin import Coin, CoinBase
 from .errors import CoinMarketCapError
 
-log = logging.getLogger("red.Trusty-cogs.Conversions")
+log = getLogger("red.Trusty-cogs.Conversions")
 
 
 class Conversions(commands.Cog):
@@ -20,15 +20,15 @@ class Conversions(commands.Cog):
     """
 
     __author__ = ["TrustyJAID"]
-    __version__ = "1.3.1"
+    __version__ = "1.3.3"
 
     def __init__(self, bot: Red) -> None:
         self.bot = bot
         self.session = aiohttp.ClientSession()
         self.coin_index: Dict[int, CoinBase] = {}
 
-    def cog_unload(self) -> None:
-        self.bot.loop.create_task(self.session.close())
+    async def cog_unload(self) -> None:
+        await self.session.close()
 
     def format_help_for_context(self, ctx: commands.Context) -> str:
         """
@@ -172,7 +172,7 @@ class Conversions(commands.Cog):
         url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
         async with self.session.get(url, headers=await self.get_header(), params=params) as resp:
             data = await resp.json()
-            coins_data = data.get("data",  {})
+            coins_data = data.get("data", {})
             for coin_id, coin_data in coins_data.items():
                 to_ret.append(Coin.from_json(coin_data))
         return to_ret
@@ -194,8 +194,7 @@ class Conversions(commands.Cog):
                 )
             else:
                 raise CoinMarketCapError(
-                    "Something went wrong, the error code is "
-                    "{code}\n`{error_message}`".format(
+                    "Something went wrong, the error code is {code}\n`{error_message}`".format(
                         code=resp.status, error_message=data["error_message"]
                     )
                 )
@@ -206,7 +205,7 @@ class Conversions(commands.Cog):
             async with self.session.get(url, headers=await self.get_header()) as resp:
                 data = await resp.json()
             if resp.status == 200:
-                self.coin_index = {c["id"]: CoinBase(**c) for c in data.get("data", [])}
+                self.coin_index = {c["id"]: CoinBase.from_json(c) for c in data.get("data", [])}
             elif resp.status == 401:
                 raise CoinMarketCapError(
                     "The bot owner has not set an API key. "
@@ -215,8 +214,7 @@ class Conversions(commands.Cog):
                 )
             else:
                 raise CoinMarketCapError(
-                    "Something went wrong, the error code is "
-                    "{code}\n`{error_message}`".format(
+                    "Something went wrong, the error code is {code}\n`{error_message}`".format(
                         code=resp.status, error_message=data["error_message"]
                     )
                 )
@@ -352,11 +350,11 @@ class Conversions(commands.Cog):
 
         msg = f"{amount} {coin.symbol} is **{price:,.2f} {currency}**\n"
         embed = discord.Embed(
-            description=msg, colour=coin_colour.get(coin.name, discord.Colour.dark_grey())
+            description=msg,
+            colour=coin_colour.get(coin.name, discord.Colour.dark_grey()),
         )
-        embed.set_footer(text="As of")
         embed.set_author(name=coin.name, url=coin_url, icon_url=coin_image)
-        embed.timestamp = coin.last_updated
+        embed.add_field(name="Last Updated", value=discord.utils.format_dt(coin.last_updated))
         if full:
             hour_1 = coin.quote["USD"].percent_change_1h
             hour_24 = coin.quote["USD"].percent_change_24h
@@ -401,7 +399,8 @@ class Conversions(commands.Cog):
         `[currency]` is the currency you want to convert to defaults to USD
         """
         stock = "https://query1.finance.yahoo.com/v8/finance/chart/{}"
-        async with self.session.get(stock.format(ticker.upper())) as resp:
+        headers = {"User-Agent": f"Red Trusty-cogs conversions on {self.bot.user.name}"}
+        async with self.session.get(stock.format(ticker.upper()), headers=headers) as resp:
             data = await resp.json()
         if not data["chart"]["result"]:
             await ctx.send(
@@ -424,7 +423,9 @@ class Conversions(commands.Cog):
         last_updated = datetime.datetime.utcfromtimestamp(ticker_data["regularMarketTime"])
         msg = "{0} is {1:,.2f} {2}".format(ticker.upper(), price, currency.upper())
         embed = discord.Embed(
-            description="Stock Price", colour=discord.Colour.lighter_grey(), timestamp=last_updated
+            description="Stock Price",
+            colour=discord.Colour.lighter_grey(),
+            timestamp=last_updated,
         )
         embed.set_footer(text="Last Updated")
         embed.add_field(name=ticker.upper(), value=msg)
@@ -490,8 +491,9 @@ class Conversions(commands.Cog):
         """Function to convert different currencies"""
         conversion = None
         try:
+            headers = {"User-Agent": f"Red Trusty-cogs conversions on {self.bot.user.name}"}
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{currency1}{currency2}=x"
-            async with self.session.get(url) as resp:
+            async with self.session.get(url, headers=headers) as resp:
                 data = await resp.json()
             results = data.get("chart", {}).get("result", [])
             conversion = results[0].get("meta", {}).get("regularMarketPrice")

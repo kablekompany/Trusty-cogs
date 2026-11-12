@@ -1,28 +1,32 @@
-import json
-import logging
-import re
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Literal, Optional
 
 import aiohttp
 import discord
 from discord.ext import tasks
+from red_commons.logging import getLogger
+from redbot import VersionInfo, version_info
 from redbot.core import Config, commands
 from redbot.core.bot import Red
-from redbot.core.utils.chat_formatting import box, humanize_number, pagify
-from tabulate import tabulate
+from redbot.core.utils.chat_formatting import box, pagify
+from redbot.core.utils.views import SimpleMenu
 
-from .profile import Activities, Activity, Profile
+from .helpers import get_runedate
+from .menus import BaseMenu, GEChartPages, GESinglePages
+from .profile import (
+    Activities,
+    APIError,
+    HiscoreInstance,
+    HiscoreProfile,
+    PlayerEvent,
+    PlayerEvents,
+)
+from .tms import TMSTransformer, TravellingMerchant
+from .viswax import RuneGoldberg, RuneTransformer
+from .wikiapi import GameEnum, WikiAPI, WikiAPIError
+from .wilderness import WildernessFlashEvents
 
-log = logging.getLogger("red.trusty-cogs.runescape")
-
-IMAGE_URL = "https://runescape.wiki/w/Special:FilePath/"
-
-
-LVL_RE = re.compile(r"Levelled Up (\w+)", flags=re.I)
-XP_RE = re.compile(r"\d+XP IN (.+)", flags=re.I)
-KILLED_RE = re.compile(r"(?:I )?(?:killed|defeated) (?:\d+ |the )?([a-z \-,]+)", flags=re.I)
-FOUND_RE = re.compile(r"I found (?:a pair of|some|a|an) (.+)", flags=re.I)
+log = getLogger("red.trusty-cogs.runescape")
 
 
 class Runescape(commands.Cog):
@@ -31,7 +35,7 @@ class Runescape(commands.Cog):
     """
 
     __author__ = ["TrustyJAID"]
-    __version__ = "1.3.3"
+    __version__ = "1.6.0"
 
     def __init__(self, bot):
         self.bot: Red = bot
@@ -40,18 +44,43 @@ class Runescape(commands.Cog):
         self.config.register_global(metrics={})
         self.metrics: Dict[str, Activities] = {}
         self.check_new_metrics.start()
-        self.session = aiohttp.ClientSession()
+        self.session = aiohttp.ClientSession(
+            headers={
+                "User-Agent": f"Red-DiscordBot Trusty-cogs Runescape cog {self.__version__} on {self.bot.user}"
+            }
+        )
+        self.wiki_api = WikiAPI(session=self.session)
+        self._repo = ""
+        self._commit = ""
 
     def format_help_for_context(self, ctx: commands.Context) -> str:
         """
         Thanks Sinbad!
         """
         pre_processed = super().format_help_for_context(ctx)
-        return f"{pre_processed}\n\nCog Version: {self.__version__}"
+        ret = f"{pre_processed}\n\nCog Version: {self.__version__}\n"
+        # we'll only have a repo if the cog was installed through Downloader at some point
+        if self._repo:
+            ret += f"Repo: {self._repo}\n"
+        # we should have a commit if we have the repo but just incase
+        if self._commit:
+            ret += f"Commit: [{self._commit[:9]}]({self._repo}/tree/{self._commit})"
+        return ret
 
-    def cog_unload(self):
+    async def cog_load(self):
+        downloader = self.bot.get_cog("Downloader")
+        if not downloader:
+            return
+        cogs = await downloader.installed_cogs()
+        for cog in cogs:
+            if cog.name == "runescape":
+                if cog.repo is not None:
+                    self._repo = cog.repo.clean_url
+                self._commit = cog.commit
+
+    async def cog_unload(self):
         self.check_new_metrics.cancel()
-        self.bot.loop.create_task(self.session.close())
+        await self.session.close()
 
     async def red_delete_data_for_user(
         self,
@@ -64,15 +93,15 @@ class Runescape(commands.Cog):
         """
         await self.config.user_from_id(user_id).clear()
 
-    @tasks.loop(seconds=60)
+    @tasks.loop(seconds=180)
     async def check_new_metrics(self):
         for username, activities in self.metrics.items():
             try:
-                data = await self.get_profile(username, 20)
+                data = await PlayerEvents.get(username, session=self.session)
             except Exception:
                 log.exception("Error pulling profile info for %s", username)
                 continue
-            for activity in reversed(data.activities):
+            for activity in reversed(data.events):
                 if activity.id not in activities.posted_activities:
                     await self.post_activity(data, activities.channels, activity)
                     activities.last_timestamp = int(activity.date.timestamp())
@@ -82,43 +111,24 @@ class Runescape(commands.Cog):
                         metrics[username] = activities.to_json()
 
     async def post_activity(
-        self, profile: Profile, channels: Dict[str, int], activity: Activity
+        self, profile: PlayerEvents, channels: Dict[str, int], activity: PlayerEvent
     ) -> None:
-        timestamp = int(activity.date.timestamp())
-        url = f"https://apps.runescape.com/runemetrics/app/overview/player/{profile.name}"
-        msg = f"{profile.name}: {activity.text}\n{activity.details}\n\n<t:{timestamp}>"
-        image_url = None
-        page = None
-        if match := KILLED_RE.search(activity.text):
-            page = match.group(1).strip()
-            if page.endswith("s"):
-                page = page[:-1]
-            page = page.replace(" ", "_")
-            if "-" in page:
-                page = page.title()
-            else:
-                page = page.capitalize()
-            image_url = IMAGE_URL + page + ".png"
-        if match := XP_RE.search(activity.text):
-            page = match.group(1).strip()
-            image_url = IMAGE_URL + page.replace(" ", "_").capitalize() + ".png"
-        if match := LVL_RE.search(activity.text):
-            page = match.group(1).strip()
-            image_url = IMAGE_URL + page.replace(" ", "_").capitalize() + ".png"
-        if match := FOUND_RE.search(activity.text):
-            page = match.group(1).strip() + " detail"
-            image_url = IMAGE_URL + page.replace(" ", "_").capitalize() + ".png"
+        embed = activity.embed(profile.name)
+        text = activity.format_text()
 
         for channel_id, guild_id in channels.items():
             guild = self.bot.get_guild(guild_id)
+            if not guild:
+                continue
             channel = guild.get_channel(int(channel_id))
+            if not channel or isinstance(channel, (discord.ForumChannel, discord.CategoryChannel)):
+                continue
+            if not channel.permissions_for(guild.me).send_messages:
+                continue
             if channel.permissions_for(guild.me).embed_links:
-                em = discord.Embed(description=f"[{msg}]({url})")
-                if image_url:
-                    em.set_thumbnail(url=image_url)
-                await channel.send(embed=em)
+                await channel.send(embed=embed)
             else:
-                await channel.send(msg)
+                await channel.send(text)
 
     @check_new_metrics.before_loop
     async def before_checking_metrics(self):
@@ -134,98 +144,51 @@ class Runescape(commands.Cog):
                 for username, activities in self.metrics.items():
                     metrics[username] = activities.to_json()
 
-    @commands.group(name="runescape", aliases=["rs"])
+    @commands.hybrid_group(name="runescape", aliases=["rs"])
     async def runescape(self, ctx: commands.Context):
         """Search for a user account or profile"""
-        pass
-
-    @commands.group(name="osrs")
-    async def osrs(self, ctx: commands.Context) -> None:
-        """Search for OSRS highscores"""
         pass
 
     @runescape.command(name="wiki")
     async def runescape_wiki(self, ctx: commands.Context, *, search: str):
         """Look for something on the runescape Wiki."""
         base_url = "https://runescape.wiki/w/?curid="
-        wiki_url = "https://runescape.wiki/api.php"
-        params = {
-            "action": "query",
-            "list": "search",
-            "srsearch": search,
-            "format": "json",
-        }
-        headers = {"User-Agent": f"Red-DiscordBot Trusty-cogs wiki lookup on {self.bot.user}"}
-        async with self.session.get(wiki_url, headers=headers, params=params) as r:
-            if r.status == 200:
-                data = await r.json()
-            else:
-                await ctx.send(f"I could not find information about `{search}` on the Runescape Wiki.")
+        async with ctx.typing():
+            try:
+                data = await self.wiki_api.search(GameEnum.runescape, search)
+            except WikiAPIError as e:
+                log.debug(e)
+                await ctx.send(
+                    f"I could not find information about `{search}` on the Runescape Wiki."
+                )
                 return
-        msg = f"Runescape Wiki Results for `{search}`:\n"
-        for search in data["query"]["search"]:
-            page_id = search["pageid"]
-            title = search['title']
-            msg += f"[{title}]({base_url}{page_id})\n"
+            msg = f"Runescape Wiki Results for `{search}`:\n"
+            for _search in data["query"]["search"]:
+                page_id = _search["pageid"]
+                title = _search["title"]
+                msg += f"[{title}]({base_url}{page_id})\n"
         await ctx.maybe_send_embed(msg)
 
-    @osrs.command(name="wiki")
-    async def osrs_wiki(self, ctx: commands.Context, *, search: str):
-        """Look for something on the runescape Wiki."""
-        base_url = "https://oldschool.runescape.wiki/w/?curid="
-        wiki_url = "https://oldschool.runescape.wiki/api.php"
-        params = {
-            "action": "query",
-            "list": "search",
-            "srsearch": search,
-            "format": "json",
-        }
-        headers = {"User-Agent": f"Red-DiscordBot Trusty-cogs wiki lookup on {self.bot.user}"}
-        async with self.session.get(wiki_url, headers=headers, params=params) as r:
-            if r.status == 200:
-                data = await r.json()
-            else:
-                await ctx.send(f"I could not find information about `{search}` on the Runescape Wiki.")
-                return
-        msg = f"Old School Runescape Wiki Results for `{search}`:\n"
-        for search in data["query"]["search"]:
-            page_id = search["pageid"]
-            title = search['title']
-            msg += f"[{title}]({base_url}{page_id})\n"
-        await ctx.maybe_send_embed(msg)
+    @runescape.command(name="ge")
+    @commands.bot_has_permissions(embed_links=True)
+    async def runescape_ge(self, ctx: commands.Context, *, search: str):
+        """Look for something on the runescape Grand Exchange.
 
-    @osrs.command(name="stats")
-    async def osrs_stats(self, ctx: commands.Context, runescape_name: str = None) -> None:
-        """Display a players stats in oldschool Runescape."""
-        await ctx.trigger_typing()
-        if runescape_name is None:
-            runescape_name = await self.config.user(ctx.author).osrsn()
-            if runescape_name is None:
-                await ctx.send("You need to set your Runescape name first!")
-                return
-
-        details = await self.get_osrs_hiscores(runescape_name)
-        if not details:
-            return await ctx.send("I can't find username `{}`".format(runescape_name))
-        msg = await self.osrs_stats_page(details, runescape_name)
-        for page in pagify(msg):
-            await ctx.send(box(page, lang="css"))
-
-    @osrs.command(name="set")
-    async def osrs_set(
-        self, ctx: commands.Context, *, runescape_name: Optional[str] = None
-    ) -> None:
+        You can lookup multiple items at once by separating them with `|`
+        e.g. `[p]rs ge bond|fractured staff of armadyl`
         """
-        Set your runescape name for easer commands.
-
-        Use this command without a name to clear your settings.
-        """
-        if not runescape_name:
-            await self.config.user(ctx.author).clear()
-            await ctx.send("Your Runescape name has been cleared.")
-        else:
-            await self.config.user(ctx.author).osrsn.set(runescape_name)
-            await ctx.send("Your Old School Runescape name has been set.")
+        async with ctx.typing():
+            try:
+                if len(search.split("|")) > 1:
+                    data = await self.wiki_api.latest(game=GameEnum.runescape, name=search)
+                    source = GESinglePages(data, self.wiki_api)
+                else:
+                    data = await self.wiki_api.last90d(game=GameEnum.runescape, name=search)
+                    source = GEChartPages([data], self.wiki_api)
+            except WikiAPIError as e:
+                await ctx.send(e)
+                return
+        await BaseMenu(source, self).start(ctx)
 
     @runescape.group(name="set")
     async def runescape_set(self, ctx: commands.Context) -> None:
@@ -234,7 +197,7 @@ class Runescape(commands.Cog):
         """
         pass
 
-    @runescape_set.command(name="metrics")
+    @runescape_set.command(name="metrics", with_app_command=False)
     @commands.mod_or_permissions(manage_channels=True)
     async def runescape_set_metrics(
         self, ctx: commands.Context, runescape_name: str, channel: discord.TextChannel
@@ -245,28 +208,29 @@ class Runescape(commands.Cog):
         `<runescape_name>` The Runescape Name of the account you want to follow
         `<channel>` The channel where updates should be posted
         """
-        data = await self.get_profile(runescape_name, 20)
-        if data == "NO PROFILE":
-            await ctx.send("The account {} doesn't appear to exist!".format(runescape_name))
-            return
-        if runescape_name.lower() not in self.metrics:
-            activities = Activities(
-                channels={str(channel.id): channel.guild.id},
-                last_id=None,
-                username=runescape_name.lower(),
-                last_timestamp=0,
-                posted_activities=[],
-            )
-            self.metrics[runescape_name.lower()] = activities
-        else:
-            self.metrics[runescape_name.lower()].channels[str(channel.id)] = channel.guild.id
+        async with ctx.typing():
+            data = await PlayerEvents.get(runescape_name, session=self.session)
+            if data == "NO PROFILE":
+                await ctx.send(f"The account {runescape_name} doesn't appear to exist!")
+                return
+            if runescape_name.lower() not in self.metrics:
+                activities = Activities(
+                    channels={str(channel.id): channel.guild.id},
+                    last_id=None,
+                    username=runescape_name.lower(),
+                    last_timestamp=0,
+                    posted_activities=[],
+                )
+                self.metrics[runescape_name.lower()] = activities
+            else:
+                self.metrics[runescape_name.lower()].channels[str(channel.id)] = channel.guild.id
         async with self.config.metrics() as metrics:
             metrics[runescape_name.lower()] = self.metrics[runescape_name.lower()].to_json()
         await ctx.send(
             f"{runescape_name} will now have RuneMetrics updates posted in {channel.mention}"
         )
 
-    @runescape_set.command(name="remove", aliases=["delete", "del", "rem"])
+    @runescape_set.command(name="remove", aliases=["delete", "del", "rem"], with_app_command=False)
     @commands.mod_or_permissions(manage_channels=True)
     async def runescape_remove_metrics(
         self, ctx: commands.Context, runescape_name: str, channel: discord.TextChannel
@@ -277,12 +241,13 @@ class Runescape(commands.Cog):
         `<runescape_name>` The Runescape Name of the account you are following
         `<channel>` The channel where updates should stop being posted
         """
-        data = await self.get_profile(runescape_name, 20)
+        async with ctx.typing():
+            data = await PlayerEvents.get(runescape_name, session=self.session)
         if data == "NO PROFILE":
-            await ctx.send("The account {} doesn't appear to exist!".format(runescape_name))
+            await ctx.send(f"The account {runescape_name} doesn't appear to exist!")
             return
         if runescape_name.lower() not in self.metrics:
-            await ctx.send("The account {} is not being followed!".format(runescape_name))
+            await ctx.send(f"The account {runescape_name} is not being followed!")
         else:
             if str(channel.id) in self.metrics[runescape_name.lower()].channels:
                 del self.metrics[runescape_name.lower()].channels[str(channel.id)]
@@ -291,9 +256,7 @@ class Runescape(commands.Cog):
                         runescape_name.lower()
                     ].to_json()
                 await ctx.send(
-                    "The account {} will no longer have rune metrics updates in {}".format(
-                        runescape_name, channel.mention
-                    )
+                    f"The account {runescape_name} will no longer have rune metrics updates in {channel.mention}"
                 )
                 if len(self.metrics[runescape_name.lower()].channels) == 0:
                     del self.metrics[runescape_name.lower()]
@@ -301,9 +264,7 @@ class Runescape(commands.Cog):
                         del metrics[runescape_name.lower()]
             else:
                 await ctx.send(
-                    "The account {} is not posting metrics updates in {}".format(
-                        runescape_name, channel.mention
-                    )
+                    "The account {runescape_name} is not posting metrics updates in {channel.mention}"
                 )
 
     @runescape_set.command(name="username")
@@ -315,206 +276,353 @@ class Runescape(commands.Cog):
 
         Use this command without a name to clear your settings.
         """
-        if not runescape_name:
-            await self.config.user(ctx.author).clear()
-            await ctx.send("Your Runescape name has been cleared.")
-        else:
-            await self.config.user(ctx.author).rsn.set(runescape_name)
-            await ctx.send("Your Runescape name has been set. To change re-do this command.")
+        async with ctx.typing():
+            if not runescape_name:
+                await self.config.user(ctx.author).clear()
+                await ctx.send("Your Runescape name has been cleared.")
+            else:
+                await self.config.user(ctx.author).rsn.set(runescape_name)
+                await ctx.send("Your Runescape name has been set. To change re-do this command.")
 
-    async def osrs_highscores(self, runescape_name: str) -> str:
-        return "https://secure.runescape.com/m=hiscore_oldschool/index_lite.ws?player={}".format(
-            runescape_name
-        )
+    @runescape.command(aliases=["stats"])
+    async def hiscore(
+        self,
+        ctx: commands.Context,
+        instance: HiscoreInstance = HiscoreInstance.HISCORE,
+        *,
+        runescape_name: Optional[str] = None,
+    ):
+        """
+        Lookup your stats on the Runescape Hiscores!
 
-    async def get_osrs_hiscores(self, runescape_name: str) -> Optional[dict]:
-        async with self.session.get(await self.osrs_highscores(runescape_name)) as resp:
-            if resp.status != 200:
-                return None
-            return await resp.read()
+        `<instance>` - The Hiscore Instance you want to lookup stats for.
+        `<runescape_name>` - Your Runescape name displayed in game.
+        """
+        async with ctx.typing():
+            if runescape_name is None:
+                runescape_name = await self.config.user(ctx.author).rsn()
+                if runescape_name is None:
+                    await ctx.send("You need to set your Runescape name or provide one.")
+                    return
+            try:
+                profile = await HiscoreProfile.get(
+                    runescape_name, instance=instance, session=self.session
+                )
+            except APIError:
+                await ctx.send(
+                    f"I can't find username `{runescape_name}` in the {instance.to_str}."
+                )
+                return
+            msg = await profile.get_stats_table()
+            embeds = []
+            for page in pagify(msg, delims=["\n"], page_length=2048):
+                embeds.append(
+                    discord.Embed(
+                        description=box(page, lang="css"),
+                        colour=await ctx.embed_colour(),
+                    )
+                )
 
-    async def make_url_profile(self, runescape_name: str, activities: int) -> str:
-        url = (
-            "https://apps.runescape.com/runemetrics/profile/profile?user={}&activities={}".format(
-                runescape_name, activities
-            )
-        )
-        log.debug(url)
-        return url
-
-    async def make_url_player_details(self, runescape_name: str) -> str:
-        return "http://services.runescape.com/m=website-data/playerDetails.ws?names=%5B%22{}%22%5D&callback=jQuery000000000000000_0000000000&_=0".format(
-            runescape_name
-        )
-
-    async def get_player_details(self, runescape_name: str) -> dict:
-        async with self.session.get(await self.make_url_player_details(runescape_name)) as resp:
-            data = await resp.text()
-        try:
-            json_data = json.loads(
-                data.replace("jQuery000000000000000_0000000000([", "").replace("]);", "")
-            )
-        except Exception:
-            return {}
-        return json_data
-        # return await resp.json()
-
-    async def get_data_profile(self, runescape_name: str, activities: int) -> dict:
-        async with self.session.get(
-            await self.make_url_profile(runescape_name, activities)
-        ) as resp:
-            data = await resp.json()
-        # log.debug(data)
-        return data
-
-    async def get_profile_obj(self, profile_data: dict) -> Profile:
-        ret = await Profile.from_json(profile_data)
-        # log.debug(ret)
-        return ret
-
-    async def get_profile(self, runescape_name: str, activities: int = 5) -> Profile:
-        data = await self.get_data_profile(runescape_name, activities)
-        if "error" in data:
-            return "NO PROFILE"
-        return await self.get_profile_obj(data)
+        await SimpleMenu(embeds).start(ctx)
 
     @runescape.command()
-    async def profile(
-        self, ctx: commands.Context, runescape_name: str = None, activity: int = 10
-    ) -> None:
-        """Display a players profile in Runescape"""
-        await ctx.trigger_typing()
-        if runescape_name is None:
-            runescape_name = await self.config.user(ctx.author).rsn()
+    async def events(self, ctx: commands.Context, *, runescape_name: Optional[str] = None):
+        """
+        Lookup your latest activities.
+
+        `<runescape_name>` - Your Runescape name displayed in game.
+        """
+        async with ctx.typing():
             if runescape_name is None:
-                await ctx.send("You need to set your Runescape name first!")
+                runescape_name = await self.config.user(ctx.author).rsn()
+                if runescape_name is None:
+                    await ctx.send("You need to set your Runescape name or provide one.")
+                    return
+            try:
+                profile = await PlayerEvents.get(runescape_name, session=self.session)
+            except APIError:
+                await ctx.send(f"I can't find username `{runescape_name}`.")
                 return
-
-        details = await self.get_player_details(runescape_name)
-        data = await self.get_profile(runescape_name, activity)
-        log.debug(details)
-        if data == "NO PROFILE":
-            await ctx.send("The account {} doesn't appear to exist!".format(runescape_name))
-            return
-        embed = await self.profile_embed(data, details)
-        await ctx.send(embed=embed)
-
-    @runescape.command()
-    async def stats(self, ctx: commands.Context, *, runescape_name: str = None) -> None:
-        """Display a players stats in Runescape"""
-        await ctx.trigger_typing()
-        if runescape_name is None:
-            runescape_name = await self.config.user(ctx.author).rsn()
-            if runescape_name is None:
-                await ctx.send("You need to set your Runescape name first!")
-                return
-
-        data = await self.get_profile(runescape_name)
-        if data == "NO PROFILE":
-            await ctx.send("The account {} doesn't appear to exist!".format(runescape_name))
-            return
-        skills = await self.stats_message(data)
-        await ctx.maybe_send_embed(skills)
+        await ctx.send(embed=profile.embed())
 
     @runescape.command()
     async def reset(self, ctx: commands.Context) -> None:
-        """Show Runescapes Daily, Weekly, and Monthly reset times."""
-        today = datetime.now(timezone.utc).replace(minute=0)
-        daily = today + timedelta(hours=((0 - today.hour) % 24))
-        weekly = daily + timedelta(days=((2 - daily.weekday()) % 7))
-        monthly = datetime(
-            year=daily.year, month=daily.month, day=28, hour=0, tzinfo=timezone.utc
-        ) + timedelta(days=4)
-        weekly_reset_str = int(weekly.timestamp())
-        daily_reset_str = int(daily.timestamp())
-        monthly_reset_str = int(monthly.timestamp())
-        msg = (
-            "Daily Reset is <t:{daily}:R> (<t:{daily}>).\n"
-            "Weekly reset is <t:{weekly}:R> (<t:{weekly}>).\n"
-            "Monthly Reset is <t:{month}:R> (<t:{month}>)."
-        ).format(weekly=weekly_reset_str, daily=daily_reset_str, month=monthly_reset_str)
+        """Show Runescape's Daily, Weekly, and Monthly reset times."""
+        async with ctx.typing():
+            today = datetime.now(timezone.utc).replace(minute=0, second=0)
+            daily = today + timedelta(hours=((0 - today.hour) % 24))
+            weekly = daily + timedelta(days=((2 - daily.weekday()) % 7))
+            monthly = datetime(
+                year=daily.year, month=daily.month, day=28, hour=0, tzinfo=timezone.utc
+            ) + timedelta(days=4)
+            weekly_reset_str = int(weekly.timestamp())
+            daily_reset_str = int(daily.timestamp())
+            monthly_reset_str = int(monthly.timestamp())
+            runedate = get_runedate()
+            msg = (
+                f"Runedate {runedate:.2f}.\n"
+                f"Daily Reset is <t:{daily_reset_str}:R> (<t:{daily_reset_str}>).\n"
+                f"Weekly reset is <t:{weekly_reset_str}:R> (<t:{weekly_reset_str}>).\n"
+                f"Monthly Reset is <t:{monthly_reset_str}:R> (<t:{monthly_reset_str}>)."
+            )
         await ctx.send(msg)
 
-    async def stats_message(self, p: Profile) -> str:
-        table = str(p)
-        top_row_len = len(table.split("\n")[0])
-        top_row = top_row_len * "-"
-        spaces = int(((top_row_len - (14 + len(p.name))) / 2) - 1) * " "
-        skills = (
-            "```css\n{top_row}\n|{spaces}"
-            "RS3 STATS FOR {user}{spaces}|"
-            "\n{top_row}\n{skills}\n{top_row}```"
-        ).format(spaces=spaces, top_row=top_row, user=p.name, skills=table)
-        return skills
+    ######################################################################################
+    # OldSchool Runescape commands                                                       #
+    ######################################################################################
 
-    async def osrs_stats_page(self, data: dict, runescape_name: str) -> str:
-        table = await Profile.from_text(data)
-        top_row_len = len(table.split("\n")[0])
-        top_row = top_row_len * "-"
-        spaces = int(((top_row_len - (14 + len(runescape_name))) / 2) - 1) * " "
-        skills = (
-            "{top_row}\n|{spaces}OSRS STATS FOR "
-            "{user}{spaces}|\n{top_row}\n"
-            "{skills}\n{top_row}"
-        ).format(spaces=spaces, top_row=top_row, user=runescape_name, skills=table)
-        return skills
+    @runescape.group(name="osrs")
+    async def osrs(self, ctx: commands.Context) -> None:
+        """Search for OSRS highscores"""
+        pass
 
-    async def profile_embed(self, profile: Profile, details: dict) -> discord.Embed:
-        em = discord.Embed()
-        if details and details["isSuffix"]:
-            em.set_author(name="{} {}".format(profile.name, details["title"]))
-        elif details:
-            em.set_author(name="{} {}".format(details["title"], profile.name))
+    @osrs.command(name="wiki")
+    async def osrs_wiki(self, ctx: commands.Context, *, search: str):
+        """Look for something on the runescape Wiki."""
+        base_url = "https://oldschool.runescape.wiki/w/?curid="
+        async with ctx.typing():
+            try:
+                data = await self.wiki_api.search(GameEnum.oldschool, search)
+            except WikiAPIError as e:
+                log.debug(e)
+                await ctx.send(
+                    f"I could not find information about `{search}` on the Runescape Wiki."
+                )
+                return
+            msg = f"Old School Runescape Wiki Results for `{search}`:\n"
+            for _search in data["query"]["search"]:
+                page_id = _search["pageid"]
+                title = _search["title"]
+                msg += f"[{title}]({base_url}{page_id})\n"
+        await ctx.maybe_send_embed(msg)
+
+    @osrs.command(name="ge")
+    @commands.bot_has_permissions(embed_links=True)
+    async def osrs_ge(self, ctx: commands.Context, *, search: str):
+        """
+        Look for something on the runescape Grand Exchange.
+
+        You can lookup multiple items at once by separating them with `|`
+        e.g. `[p]rs osrs ge bond|abyssal whip`
+        """
+        async with ctx.typing():
+            try:
+                if len(search.split("|")) > 1:
+                    data = await self.wiki_api.latest(game=GameEnum.oldschool, name=search)
+                    source = GESinglePages(data, self.wiki_api)
+                else:
+                    data = await self.wiki_api.last90d(game=GameEnum.oldschool, name=search)
+                    source = GEChartPages([data], self.wiki_api)
+            except WikiAPIError as e:
+                await ctx.send(e)
+                return
+        await BaseMenu(source, self).start(ctx)
+
+    @osrs.command(name="hiscore", aliases=["stats"])
+    async def osrs_hiscore(
+        self, ctx: commands.Context, *, runescape_name: Optional[str] = None
+    ) -> None:
+        """Display a players stats in OldSchool Runescape."""
+        async with ctx.typing():
+            if runescape_name is None:
+                runescape_name = await self.config.user(ctx.author).osrsn()
+                if runescape_name is None:
+                    await ctx.send("You need to set your Runescape name first!")
+                    return
+
+        await self.hiscore(ctx, HiscoreInstance.HISCORE_OLDSCHOOL, runescape_name=runescape_name)
+
+    @osrs.command(name="activities")
+    @commands.bot_has_permissions(embed_links=True)
+    async def osrs_activities(
+        self, ctx: commands.Context, *, runescape_name: Optional[str] = None
+    ) -> None:
+        """Display a players Activities in OldSchool Runescape Hiscores."""
+        async with ctx.typing():
+            if runescape_name is None:
+                runescape_name = await self.config.user(ctx.author).osrsn()
+                if runescape_name is None:
+                    await ctx.send("You need to set your Runescape name first!")
+                    return
+
+            try:
+                profile = await HiscoreProfile.get(
+                    runescape_name,
+                    instance=HiscoreInstance.HISCORE_OLDSCHOOL,
+                    session=self.session,
+                )
+            except APIError:
+                await ctx.send(f"I can't find username `{runescape_name}`")
+                return
+            msg = await profile.get_profile_table()
+            embeds = []
+            for page in pagify(msg, delims=["\n"], page_length=1024):
+                embeds.append(
+                    discord.Embed(
+                        description=box(page, lang="css"),
+                        colour=await ctx.embed_colour(),
+                    )
+                )
+
+        await SimpleMenu(embeds).start(ctx)
+
+    @osrs.command(name="set")
+    async def osrs_set(
+        self, ctx: commands.Context, *, runescape_name: Optional[str] = None
+    ) -> None:
+        """
+        Set your runescape name for easer commands.
+
+        Use this command without a name to clear your settings.
+        """
+        async with ctx.typing():
+            if not runescape_name:
+                await self.config.user(ctx.author).clear()
+                await ctx.send("Your Runescape name has been cleared.")
+            else:
+                await self.config.user(ctx.author).osrsn.set(runescape_name)
+                await ctx.send("Your Old School Runescape name has been set.")
+
+    ######################################################################################
+    # Commands that can be removed                                                       #
+    ######################################################################################
+
+    @runescape.command(aliases=["flash", "wildyflash", "wildy"], with_app_command=False)
+    async def wilderness(self, ctx: commands.Context) -> None:
+        """Show Runescape's Daily, Weekly, and Monthly reset times."""
+        async with ctx.typing():
+            msg = "## Wilderness Flash Event Schedule\n"
+            max_spaces = 26
+            today = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+            for event in sorted(
+                [e for e in WildernessFlashEvents], key=lambda x: x.get_next(today)
+            ):
+                special = "*" if event.special else ""
+                event_name = special + str(event)
+                url = "https://runescape.wiki/w/Wilderness_Flash_Events#" + str(event).replace(
+                    " ", "_"
+                )
+                ts = discord.utils.format_dt(event.get_next(today), "R")
+                special_header = "### " if event.special else ""
+                msg += f"{special_header}- `{event_name.ljust(max_spaces)}` - {ts} [link]({url})\n"
+            wild_rewards_url = "https://runescape.wiki/w/Sack_of_very_wild_rewards"
+            msg += (
+                f"-# *Special events can drop a [sack of very wild rewards]({wild_rewards_url})."
+            )
+        await ctx.maybe_send_embed(msg)
+
+    @runescape.command(name="vis", aliases=["viswax"], with_app_command=False)
+    async def runescape_viswax(
+        self, ctx: commands.Context, known: Optional[RuneTransformer] = None
+    ):
+        """
+        Get the current combinations for vis wax
+
+        https://runescape.wiki/w/Rune_Goldberg_Machine
+
+        - `[known]` If you have the Runescrafting skill cape and know your third slot rune
+        you can provide it here to include on the display.
+        """
+        await ctx.typing()
+        rgb = RuneGoldberg(known_rune=known)
+        if version_info < VersionInfo.from_str("3.5.21"):
+            if await ctx.embed_requested():
+                em = rgb.embed()
+                await ctx.send(embed=em)
+            else:
+                await ctx.send(str(rgb))
+            return
+
+        view = rgb.layout()
+        await ctx.send(view=view)
+
+    @runescape.command(name="tms", aliases=["merchant"], with_app_command=False)
+    async def runescape_merchant(self, ctx: commands.Context, item: Optional[TMSTransformer]):
+        """
+        Get the current Travelling Merchant items
+
+        https://runescape.wiki/w/Travelling_Merchant's_Shop
+        - `[item]` if provided can list the next 5 times that item appears.
+        """
+        await ctx.typing()
+        if item is None:
+            tms = TravellingMerchant()
+            if version_info < VersionInfo.from_str("3.5.21"):
+                if await ctx.embed_requested():
+                    embeds = tms.embeds()
+                    await ctx.send(embeds=embeds)
+                else:
+                    await ctx.send(str(tms))
+                return
+
+            view = tms.layout()
+            await ctx.send(view=view)
         else:
-            em.set_author(name=profile.name)
-        activities = ""
-        for activity in profile.activities:
-            activities += f"[<t:{int(activity.date.timestamp())}>] {activity.details}\n"
+            tms = await TravellingMerchant.find_next(item, 5)
+            if version_info < VersionInfo.from_str("3.5.21"):
+                msg = f"Next 5 {item} at the Travelling Merchant's Shop\n"
+                msg += "\n".join(i.list_items() for i in tms)
+                if await ctx.embed_requested():
+                    em = discord.Embed(
+                        title="Travelling Merchant's Shop",
+                        description=msg,
+                        url="https://runescape.wiki/w/Travelling_Merchant's_Shop",
+                    )
+                    em.set_thumbnail(url=item.image_url)
+                    await ctx.send(embed=em)
+                else:
+                    await ctx.send(msg)
+                return
 
-        # em.colour = int(teams[_teams.name]["home"].replace("#", ""), 16)
-        em.set_thumbnail(
-            url="http://secure.runescape.com/m=avatar-rs/{}/chat.png".format(
-                profile.name.replace(" ", "%20")
+            view = discord.ui.LayoutView()
+            container = discord.ui.Container(accent_colour=discord.ui.Colour.blurple())
+            text = discord.ui.TextDisplay(
+                f"Next 5 [{item}]{item.url} at the Travelling Merchant's Shop\n"
             )
-        )
-        em.add_field(name="Combat Level", value=profile.combatlevel)
-        em.add_field(name="Total Level", value=humanize_number(profile.totalskill))
-        em.add_field(name="Total XP", value=humanize_number(profile.totalxp))
-        quests = tabulate(
-            [[profile.questsstarted, profile.questsnotstarted, profile.questscomplete]],
-            headers=["Started", "Not Started", "Complete"],
-        )
-        combat_xp = tabulate(
-            [
-                [
-                    humanize_number(profile.magic_total),
-                    humanize_number(profile.melee_total),
-                    humanize_number(profile.ranged_total),
-                ]
-            ],
-            headers=["Magic", "Melee", "Ranged"],
-        )
-        em.add_field(
-            name="Combat XP Totals",
-            value=f"```\n{combat_xp}\n```",
-            inline=False,
-        )
-        em.add_field(
-            name="Quests",
-            value=f"```\n{quests}\n```",
-            inline=False,
-        )
-        if activities:
-            activities = list(pagify(activities, page_length=1024))[0]
-            em.add_field(name="Activities", value=activities)
-        if profile.logged_in:
-            em.set_footer(
-                text="Online",
-                icon_url="https://upload.wikimedia.org/wikipedia/commons/thumb/a/ab/Green_pog.svg/64px-Green_pog.svg.png",
+            thumbnail = discord.ui.Thumbnail(item.image_url)
+            container.add_item(discord.ui.Section(text, accessory=thumbnail))
+            container.add_item(discord.ui.Separator())
+            for item in tms:
+                container.add_item(discord.ui.TextDisplay(item.list_items()))
+                container.add_item(discord.ui.Separator())
+            view.add_item(container)
+            await ctx.send(view=view)
+
+    @runescape.command(name="nemiforest", aliases=["nemi", "forest"], with_app_command=False)
+    async def runescape_nemiforest(self, ctx: commands.Context):
+        """Display an image of a Nemi Forest instance with all nine nodes."""
+        async with ctx.typing():
+            subreddit_url = "https://api.reddit.com/r/nemiforest/new"
+            params = {
+                "limit": 1,
+            }
+
+            async with self.session.get(subreddit_url, params=params) as r:
+                if r.status == 200:
+                    data = await r.json()
+                else:
+                    await ctx.send(
+                        "I could not find any Nemi Forest instance. Reddit is probably down."
+                    )
+                    return
+
+            reddit_icon_url = "https://www.redditinc.com/assets/images/site/reddit-logo.png"
+            latest_post: Dict = data["data"]["children"][0]["data"]
+            post_author: str = latest_post["author"]
+            post_flair = latest_post["link_flair_text"]
+            post_title: str = (
+                latest_post["title"] if not post_flair else "[Depleted] " + latest_post["title"]
             )
-        else:
-            em.set_footer(
-                text="Offline",
-                icon_url="https://upload.wikimedia.org/wikipedia/commons/thumb/0/0c/Red_pog.svg/64px-Red_pog.svg.png",
+            post_url: str = latest_post["url"]
+            post_time = int(latest_post["created_utc"])
+
+            embed_color = await ctx.embed_color()
+            embed = discord.Embed(
+                title=post_title, description=f"<t:{post_time}:R>", color=embed_color
             )
-        return em
+            embed.set_image(url=post_url)
+            embed.set_footer(
+                text=f"Instance provided by {post_author} via r/NemiForest",
+                icon_url=reddit_icon_url,
+            )
+        await ctx.send(embed=embed)

@@ -1,11 +1,12 @@
-import logging
 import re
 from typing import Optional, Tuple, Union
 
 import aiohttp
 import discord
+from charset_normalizer import detect
 from discord.ext.commands.converter import Converter, IDConverter
 from discord.ext.commands.errors import BadArgument
+from red_commons.logging import getLogger
 from redbot import VersionInfo, version_info
 from redbot.core import Config, commands
 from redbot.core.bot import Red
@@ -13,15 +14,10 @@ from redbot.core.i18n import Translator
 
 from .errors import APIError, InvalidCredentials, NoCredentials, OutOfRequests
 
-try:
-    import cchardet as chardet
-except ImportError:
-    import chardet
-
 API_URL = "https://www.cleverbot.com/getreply"
 IO_API_URL = "https://cleverbot.io/1.0"
 
-log = logging.getLogger("red.trusty-cogs.Cleverbot")
+log = getLogger("red.trusty-cogs.Cleverbot")
 
 _ = Translator("cleverbot", __file__)
 
@@ -102,18 +98,16 @@ class CleverbotAPI:
         """
         This is called when we actually want to send a reply
         """
-        await ctx.trigger_typing()
+        await ctx.typing()
         try:
             response = await self.get_response(author, message)
         except NoCredentials:
-            msg = _(
-                "The owner needs to set the credentials first.\n" "See: [p]cleverbotset apikey"
-            )
+            msg = _("The owner needs to set the credentials first.\nSee: [p]cleverbotset apikey")
             await ctx.send(msg)
         except APIError as e:
             await ctx.send("Error contacting the API. Error code: {}".format(e))
         except InvalidCredentials:
-            msg = _("The token that has been set is not valid.\n" "See: [p]cleverbotset")
+            msg = _("The token that has been set is not valid.\nSee: [p]cleverbotset")
             await ctx.send(msg)
         except OutOfRequests:
             msg = _(
@@ -155,7 +149,7 @@ class CleverbotAPI:
             return await self.bot.allowed_by_whitelist_blacklist(
                 message.author,
                 who_id=message.author.id,
-                guild_id=message.guild.id,
+                guild=message.guild,
                 role_ids=[r.id for r in message.author.roles],
             )
         except AttributeError:
@@ -184,7 +178,7 @@ class CleverbotAPI:
         if tweak1 < 0:
             msg += f"{100}% sensible, "
         if tweak1 >= 0 and tweak1 < 50:
-            msg += f"{100-tweak1}% sensible, "
+            msg += f"{100 - tweak1}% sensible, "
         if tweak1 > 50:
             msg += f"{tweak1}% wacky, "
         if tweak1 == 50:
@@ -193,7 +187,7 @@ class CleverbotAPI:
         if tweak2 < 0:
             msg += f"{100}% shy, and "
         if tweak2 >= 0 and tweak2 < 50:
-            msg += f"{100-tweak2}% shy, and "
+            msg += f"{100 - tweak2}% shy, and "
         if tweak2 > 50:
             msg += f"{tweak2}% talkative, and "
         if tweak2 == 50:
@@ -202,7 +196,7 @@ class CleverbotAPI:
         if tweak3 < 0:
             msg += f"{100}% self-centered "
         if tweak3 >= 0 and tweak3 < 50:
-            msg += f"{100-tweak3}% self-centered "
+            msg += f"{100 - tweak3}% self-centered "
         if tweak3 > 50:
             msg += f"{tweak3}% attentive "
         if tweak3 == 50:
@@ -266,7 +260,7 @@ class CleverbotAPI:
         return can_run
 
     @commands.Cog.listener()
-    async def on_message(self, message: discord.Message) -> None:
+    async def on_message_without_command(self, message: discord.Message) -> None:
         guild = message.guild
         if message.author.bot:
             return
@@ -288,7 +282,7 @@ class CleverbotAPI:
                 is_reply = reference.author.id == self.bot.user.id and ctx.me in message.mentions
         if is_mention:
             text = text[len(ctx.me.display_name) + 2 :]
-            log.debug(text)
+            log.trace("CleverbotAPI text: %s", text)
         if not text:
             log.debug("No text to send to cleverbot.")
             return
@@ -384,8 +378,9 @@ class CleverbotAPI:
                 if r.status == 200:
                     try:
                         msg = await r.read()
-                        enc = chardet.detect(msg)
-                        data = await r.json(encoding=enc["encoding"])
+                        detected = detect(msg)
+                        encoding: str = detected["encoding"]
+                        data = await r.json(encoding=encoding)
                     except Exception:
                         raise APIError("Error decoding cleverbot respose.")
                     self.instances[str(author.id)] = data["cs"]  # Preserves conversation status

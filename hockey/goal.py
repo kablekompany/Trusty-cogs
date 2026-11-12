@@ -1,78 +1,90 @@
 from __future__ import annotations
 
 import asyncio
-import logging
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import discord
-from redbot import VersionInfo, version_info
+from red_commons.logging import getLogger
 from redbot.core.bot import Red
 from redbot.core.i18n import Translator
-from redbot.core.utils import AsyncIter, bounded_gather
+from redbot.core.utils import AsyncIter
+from redbot.core.utils.chat_formatting import humanize_list
 
-from .constants import HEADSHOT_URL, TEAMS
-from .helper import check_to_post, get_channel_obj, get_team
+from .helper import Team, check_to_post, get_channel_obj, get_team
 
 if TYPE_CHECKING:
-    from .game import Game
+    from yarl import URL
 
-try:
-    from .oilers import Oilers
-except ImportError:
-    pass
+    from .api import GameEventTypeCode, GoalData, Player
+    from .game import Game
+    from .hockey import Hockey
 
 
 _ = Translator("Hockey", __file__)
 
-log = logging.getLogger("red.trusty-cogs.Hockey")
+log = getLogger("red.trusty-cogs.Hockey")
 
 
 class Goal:
-
-    goal_id: str
-    team_name: str
-    scorer_id: int
-    jersey_no: str
-    description: str
-    period: int
-    period_ord: str
-    time_remaining: str
-    time: datetime
-    home_score: int
-    away_score: int
-    strength: str
-    empty_net: bool
-    event: str
-    link: Optional[str]
-
     def __init__(self, **kwargs):
         super().__init__()
         self.goal_id = kwargs.get("goal_id")
-        self.team_name = kwargs.get("team_name")
+        self.team: Team = kwargs.get("team")
         self.scorer_id = kwargs.get("scorer_id")
-        self.headshot = HEADSHOT_URL.format(kwargs.get("scorer_id", ""))
         self.jersey_no = kwargs.get("jersey_no")
         self.description = kwargs.get("description")
         self.period = kwargs.get("period")
         self.period_ord = kwargs.get("period_ord")
         self.time_remaining = kwargs.get("time_remaining")
-        time = kwargs.get("time")
         time = kwargs.get("time", "")
         time = datetime.strptime(time, "%Y-%m-%dT%H:%M:%SZ")
         self.time = time.replace(tzinfo=timezone.utc)
         self.home_score = kwargs.get("home_score")
         self.away_score = kwargs.get("away_score")
         self.strength = kwargs.get("strength")
+        self.strength_code = kwargs.get("strength_code")
         self.empty_net = kwargs.get("empty_net")
         self.event = kwargs.get("event")
-        self.link = kwargs.get("link", None)
+        self.link: Optional[Union[str, URL]] = kwargs.get("link", None)
+        self.image = kwargs.get("image", None)
         self.tasks: List[asyncio.Task] = []
         self.home_shots: int = kwargs.get("home_shots", 0)
         self.away_shots: int = kwargs.get("away_shots", 0)
+        self.situation = kwargs.get("situation")
+        self.scorer: Player = kwargs.get("scorer")
+        self.assisters: List[Player] = kwargs.get("assisters")
+        self.game_id: int = kwargs.get("game_id")
+        self.type_code: GameEventTypeCode = kwargs.get("type_code")
+        self.nhle_event = kwargs.get("nhle_event")
 
     def __repr__(self):
         return "<Hockey Goal team={0.team_name} id={0.goal_id} >".format(self)
+
+    @property
+    def team_name(self):
+        return self.team.name
+
+    @property
+    def emoji(self) -> Union[discord.PartialEmoji, str]:
+        return self.team.emoji
+
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, Goal):
+            return False
+        if (
+            self.description == other.description
+            and str(self.link) == str(other.link)
+            # if one of these is a URL then the standard == will be false causing
+            # us to constantly try and edit goals we've already edited.
+            # So instead, let's just cast to string.
+            and self.goal_id == other.goal_id
+        ):
+            return True
+        return False
+
+    def __ne__(self, other) -> bool:
+        return not self.__eq__(other)
 
     def to_json(self) -> dict:
         return {
@@ -90,10 +102,56 @@ class Goal:
             "strength": self.strength,
             "empty_net": self.empty_net,
             "event": self.event,
-            "link": self.link,
+            "link": str(self.link) if self.link is not None else None,
+            "image": self.image,
             "home_shots": self.home_shots,
             "away_shots": self.away_shots,
+            "game_id": self.game_id,
         }
+
+    @classmethod
+    def from_data(cls, data: GoalData):
+        return cls(**data)
+
+    @staticmethod
+    def get_image_and_highlight_url(
+        event_id: int, media_content: dict
+    ) -> Tuple[Optional[str], ...]:
+        image, link = None, None
+        try:
+            if media_content["media"]["milestones"]:
+                for highlight in media_content["media"]["milestones"]["items"]:
+                    if highlight["statsEventId"] == str(event_id):
+                        for playback in highlight["highlight"]["playbacks"]:
+                            if playback["name"] == "FLASH_1800K_896x504":
+                                link = playback["url"]
+                        image = (
+                            highlight["highlight"]
+                            .get("image", {})
+                            .get("cuts", {})
+                            .get("1136x640", {})
+                            .get("src", None)
+                        )
+            else:
+                for highlight in media_content["highlights"]["gameCenter"]["items"]:
+                    if "keywords" not in highlight:
+                        continue
+                    for keyword in highlight["keywords"]:
+                        if keyword["type"] != "statsEventId":
+                            continue
+                        if keyword["value"] == str(event_id):
+                            for playback in highlight["playbacks"]:
+                                if playback["name"] == "FLASH_1800K_896x504":
+                                    link = playback["url"]
+                            image = (
+                                highlight["image"]
+                                .get("cuts", {})
+                                .get("1136x640", {})
+                                .get("src", None)
+                            )
+        except KeyError:
+            pass
+        return link, image
 
     @classmethod
     async def from_json(
@@ -109,28 +167,24 @@ class Goal:
 
         if "strength" in data["result"]:
             str_dat = data["result"]["strength"]["name"]
+            strength_code = data["result"]["strength"]["code"]
             strength = "Even Strength" if str_dat == "Even" else str_dat
             if data["about"]["ordinalNum"] == "SO":
                 strength = "Shoot Out"
         else:
             strength = " "
-        empty_net = data["result"]["emptyNet"] if "emptyNet" in data["result"] else False
+            strength_code = " "
+        empty_net = data["result"].get("emptyNet", False)
         player_id = f"ID{scorer_id[0]}" if scorer_id != [] else None
         if player_id in players:
             jersey_no = players[player_id]["jerseyNumber"]
         else:
             jersey_no = ""
         link = None
+        image = None
         if media_content:
             event_id = data["about"]["eventId"]
-            try:
-                for highlight in media_content["media"]["milestones"]["items"]:
-                    if highlight["statsEventId"] == str(event_id):
-                        for playback in highlight["highlight"]["playbacks"]:
-                            if playback["name"] == "FLASH_1800K_896x504":
-                                link = playback["url"]
-            except KeyError:
-                pass
+            link, image = cls.get_image_and_highlight_url(event_id, media_content)
 
         # scorer = scorer_id[0]
         return cls(
@@ -146,9 +200,11 @@ class Goal:
             home_score=data["about"]["goals"]["home"],
             away_score=data["about"]["goals"]["away"],
             strength=strength,
+            strength_code=strength_code,
             empty_net=empty_net,
             event=data["result"]["event"],
             link=link,
+            image=image,
             home_shots=data.get("home_shots", 0),
             away_shots=data.get("away_shots", 0),
         )
@@ -167,14 +223,10 @@ class Goal:
         Creates embed and sends message if a team has scored a goal
         """
         # scorer = self.headshots.format(goal["players"][0]["player"]["id"])
+        cog: Hockey = bot.get_cog("Hockey")
+        event = cog.get_goal_save_event(game_data.game_id, str(self.goal_id), False)
         post_state = ["all", game_data.home_team, game_data.away_team]
         msg_list = []
-        if "Edmonton Oilers" in self.team_name and "missed" not in self.event.lower():
-            try:
-                hue = Oilers(bot)
-                self.tasks.append(hue.goal_lights())
-            except Exception:
-                pass
         goal_embed = await self.goal_post_embed(game_data)
         goal_text = await self.goal_post_text(game_data)
         tasks = []
@@ -184,18 +236,30 @@ class Goal:
             channel = await get_channel_obj(bot, channel_id, data)
             if not channel:
                 continue
-
-            should_post = await check_to_post(bot, channel, data, post_state, "Goal")
+            if channel.guild.me.is_timed_out():
+                continue
+            should_post = await check_to_post(
+                bot, channel, data, post_state, game_data.game_state, True
+            )
             if should_post:
-                post_data.append(
-                    await self.actually_post_goal(bot, channel, goal_embed, goal_text)
-                )
+                tasks.append(channel)
+        async for channel in AsyncIter(tasks, delay=5, steps=5):
+            post_data.append(await self.actually_post_goal(bot, channel, goal_embed, goal_text))
         # data = await bounded_gather(*tasks)
         for channel in post_data:
             if channel is None:
                 continue
             else:
                 msg_list.append(channel)
+        config = cog.config
+        async with config.teams() as teams:
+            for team in teams:
+                if team["team_name"] == self.team_name and team["game_id"] == game_data.game_id:
+                    try:
+                        team["goal_id"][str(self.goal_id)]["messages"] = msg_list
+                    except KeyError:
+                        log.error("Error saving message list for goal %r", self)
+        event.set()
         return msg_list
 
     async def actually_post_goal(
@@ -204,39 +268,58 @@ class Goal:
         try:
             guild = channel.guild
             if not channel.permissions_for(guild.me).send_messages:
-                log.debug("No permission to send messages in %s", repr(channel))
+                log.debug("No permission to send messages in %r", channel)
                 return None
+
             config = bot.get_cog("Hockey").config
             game_day_channels = await config.guild(guild).gdc()
+            game_day_threads = await config.guild(guild).gdt()
             # Don't want to ping people in the game day channels
             can_embed = channel.permissions_for(guild.me).embed_links
             can_manage_webhooks = False  # channel.permissions_for(guild.me).manage_webhooks
             role = None
-            guild_notifications = await config.guild(guild).goal_notifications()
-            channel_notifications = await config.channel(channel).goal_notifications()
-            goal_notifications = guild_notifications or channel_notifications
-            publish_goals = "Goal" in await config.channel(channel).publish_states()
-            allowed_mentions = {}
+
+            guild_image_setting = await config.guild(guild).include_goal_image()
+            channel_image_setting = await config.channel(channel).include_goal_image()
+            include_goal_image = guild_image_setting or channel_image_setting
+            send_em = goal_embed.copy()
+            files = []
+            if self.team.file is not None:
+                files.append(self.team.file)
+            if include_goal_image and self.image:
+                send_em.set_image(url=self.image)
+            # publish_goals = "Goal" in await config.channel(channel).publish_states()
+
             montreal = ["Montréal Canadiens", "Montreal Canadiens"]
+            roles = set()
+            team_role = discord.utils.get(guild.roles, name=f"{self.team_name} GOAL")
+            if team_role is None and self.team_name in montreal:
+                # Special lookup for Canadiens without the accent
+                for name in montreal:
+                    team_role = discord.utils.get(guild.roles, name=f"{name} GOAL")
+                    if team_role is not None:
+                        break
+            if team_role is not None:
+                roles.add(team_role.mention)
+            goal_roles = await config.channel(channel).game_goal_roles()
+            mention_roles = set()
 
-            role = discord.utils.get(guild.roles, name=f"{self.team_name} GOAL")
-            try:
-                if self.team_name in montreal:
-                    if not role:
-                        montreal.remove(self.team_name)
-                        role = discord.utils.get(guild.roles, name=f"{montreal[0]} GOAL")
-            except Exception:
-                log.error("Error trying to find montreal goal role")
-            if version_info >= VersionInfo.from_str("3.4.0"):
-                if goal_notifications:
-                    log.debug(goal_notifications)
-                    allowed_mentions = {"allowed_mentions": discord.AllowedMentions(roles=True)}
-                else:
-                    allowed_mentions = {"allowed_mentions": discord.AllowedMentions(roles=False)}
-
+            for team, role_ids in goal_roles.items():
+                if team not in ["all", self.team_name]:
+                    continue
+                for role_id in role_ids:
+                    if role := guild.get_role(role_id):
+                        mention_roles.add(role)
+                        roles.add(role.mention)
+            allowed_mentions = discord.AllowedMentions(roles=list(mention_roles))
+            roles_text = humanize_list(list(roles))
             if game_day_channels is not None:
                 # We don't want to ping people in the game day channels twice
                 if channel.id in game_day_channels:
+                    role = None
+
+            if game_day_threads is not None:
+                if channel.id in game_day_threads:
                     role = None
 
             if not can_embed and can_manage_webhooks:
@@ -250,24 +333,28 @@ class Goal:
                         webhook = hook
                 if webhook is None:
                     webhook = await channel.create_webhook(name=guild.me.name)
-                url = TEAMS[self.team_name]["logo"]
-                await webhook.send(username=self.team_name, avatar_url=url, embed=goal_embed)
+                logo = self.team.logo
+                await webhook.send(username=self.team_name, avatar_url=logo, embed=goal_embed)
                 return None
 
             if not can_embed and not can_manage_webhooks:
                 # Create text only message if embed_links permission is not set
-                if role is not None:
-                    msg = await channel.send(f"{role}\n{goal_text}", **allowed_mentions)
+                if roles_text:
+                    msg = await channel.send(
+                        f"{roles_text}\n{goal_text}", allowed_mentions=allowed_mentions
+                    )
                 else:
                     msg = await channel.send(goal_text)
                 # msg_list[str(channel.id)] = msg.id
 
-            if role is None or "missed" in self.event.lower():
-                msg = await channel.send(embed=goal_embed)
+            if not roles_text or "missed" in self.event.lower():
+                msg = await channel.send(embed=send_em, files=files)
                 # msg_list[str(channel.id)] = msg.id
 
             else:
-                msg = await channel.send(role.mention, embed=goal_embed, **allowed_mentions)
+                msg = await channel.send(
+                    roles_text, embed=send_em, files=files, allowed_mentions=allowed_mentions
+                )
                 # msg_list[str(channel.id)] = msg.id
             return channel.guild.id, channel.id, msg.id
         except Exception:
@@ -275,113 +362,176 @@ class Goal:
             return None
 
     @staticmethod
-    async def remove_goal_post(bot: Red, goal: str, team: str, data: Game) -> None:
+    async def remove_goal_post(bot: Red, goal_id: str, team: str, data: Game) -> None:
         """
         Attempt to delete a goal if it was pulled back
         """
-        config = bot.get_cog("Hockey").config
-        team_list = await config.teams()
-        team_data = await get_team(bot, team)
-        if goal not in [goal.goal_id for goal in data.goals]:
+        log.trace("Removing goal %s from game %s", goal_id, data)
+        cog: Hockey = bot.get_cog("Hockey")
+        config = cog.config
+        event = cog.get_goal_save_event(data.game_id, str(goal_id), True)
+        await event.wait()
+        team_data = await get_team(bot, team, data.game_start_str, data.game_id)
+        if str(goal_id) not in [str(goal.goal_id) for goal in data.goals]:
             try:
-                old_msgs = team_data["goal_id"][goal]["messages"]
+                old_msgs = team_data["goal_id"][goal_id]["messages"]
             except KeyError:
                 return
             except Exception:
                 log.exception("Error iterating saved goals")
                 return
+            msgs = []
             for guild_id, channel_id, message_id in old_msgs:
-                guild = bot.get_guild(guild_id)
+                guild = bot.get_guild(int(guild_id))
                 if not guild:
                     continue
-                channel = guild.get_channel(int(channel_id))
-                if channel and channel.permissions_for(channel.guild.me).read_message_history:
-                    try:
-                        if version_info >= VersionInfo.from_str("3.4.6"):
-                            message = channel.get_partial_message(message_id)
-                        else:
-                            message = await channel.fetch_message(message_id)
-                    except (discord.errors.NotFound, discord.errors.Forbidden):
-                        continue
-                    except Exception:
-                        log.exception(
-                            f"Error getting old goal for {str(team)} {str(goal)} in "
-                            f"{guild_id=} {channel_id=}"
-                        )
-                        pass
-                    if message is not None:
+                channel = await get_channel_obj(bot, int(channel_id), {"guild_id": int(guild_id)})
+                if not channel:
+                    continue
+                if not channel.permissions_for(channel.guild.me).read_message_history:
+                    continue
+                msgs.append(channel.get_partial_message(message_id))
+
+            async for message in AsyncIter(msgs, delay=5, steps=5):
+                try:
+                    await message.delete()
+                except (discord.errors.NotFound, discord.errors.Forbidden):
+                    pass
+                except Exception:
+                    log.exception(
+                        "Error getting old goal for %s %s in guild=%s channel=%s",
+                        team,
+                        goal_id,
+                        message.guild.id,
+                        message.channel.id,
+                    )
+
+            async with config.teams() as team_entries:
+                for team_entry in team_entries:
+                    if team_entry["team_name"] == team and team_entry["game_id"] == data.game_id:
                         try:
-                            await message.delete()
-                        except (discord.errors.NotFound, discord.errors.Forbidden):
-                            pass
-                        except Exception:
-                            log.exception(
-                                f"Error getting old goal for {str(team)} {str(goal)} in "
-                                f"{guild_id=} {channel_id=}"
-                            )
-                else:
-                    log.debug("Channel does not have permission to read history")
-            try:
-                team_list.remove(team_data)
-                del team_data["goal_id"][goal]
-                team_list.append(team_data)
-                await config.teams.set(team_list)
-            except Exception:
-                log.exception("Error removing teams goals")
-                return
+                            del team_entry["goal_id"][goal_id]
+                        except KeyError:
+                            log.exception("Error removing teams goals")
+                            continue
         return
 
-    async def edit_team_goal(
-        self, bot: Red, game_data: Game, og_msg: Tuple[int, int, int]
-    ) -> None:
+    async def edit_team_goal(self, bot: Red, game_data: Game) -> None:
         """
         When a goal scorer has changed we want to edit the original post
         """
         # scorer = self.headshots.format(goal["players"][0]["player"]["id"])
         # post_state = ["all", game_data.home_team, game_data.away_team]
-        em = await self.goal_post_embed(game_data)
-        async for guild_id, channel_id, message_id in AsyncIter(og_msg, steps=100):
-            guild = bot.get_guild(guild_id)
+        cog: Hockey = bot.get_cog("Hockey")
+        event = cog.get_goal_save_event(game_data.game_id, str(self.goal_id), True)
+        await event.wait()
+        # Wait until the initial posting has fully completed before continuing to edit
+        og_msg = []
+        old_data = await get_team(bot, self.team_name, game_data.game_start_str, self.game_id)
+        og_msg = old_data["goal_id"].get(str(self.goal_id), {}).get("messages")
+        updated_goal = cog.get_current_goal(game_data.game_id, self.goal_id)
+        if updated_goal is not None:
+            em = await updated_goal.goal_post_embed(game_data)
+            text = await updated_goal.goal_post_text(game_data)
+        else:
+            em = await self.goal_post_embed(game_data)
+            text = await self.goal_post_text(game_data)
+        if og_msg is None:
+            return
+        async for guild_id, channel_id, message_id in AsyncIter(og_msg, delay=5, steps=5):
+            guild = bot.get_guild(int(guild_id))
             if not guild:
                 continue
-            channel = guild.get_channel(int(channel_id))
+            channel = await get_channel_obj(bot, int(channel_id), {"guild_id": int(guild_id)})
             if channel is None:
                 continue
-            bot.loop.create_task(self.edit_goal(bot, channel, message_id, em))
-            # This is to prevent endlessly waiting incase someone
-            # decided to publish one of our messages we want to edit
-            # if we did bounded_gather here the gather would wait until
-            # rate limits are up for editing that one message
-            # in this case we can send off the task to do it's thing
-            # and forget about it. If one never finishes I don't care
-
+            if datetime.now(timezone.utc) - discord.utils.snowflake_time(
+                int(message_id)
+            ) >= timedelta(hours=1):
+                # Discord has a limit on how many messages older than 1 hour that can be edited.
+                # So we will just ignore any since they are likely complete and pushed out
+                # of view of chat anyway.
+                continue
+            if channel.is_news():
+                asyncio.create_task(self.edit_goal(bot, channel, message_id, em, text))
+                # This is to prevent endlessly waiting incase someone
+                # decided to publish one of our messages we want to edit
+                # if we did bounded_gather here the gather would wait until
+                # rate limits are up for editing that one message
+                # in this case we can send off the task to do it's thing
+                # and forget about it. If one never finishes I don't care
+            else:
+                await self.edit_goal(bot, channel, message_id, em, text)
         return
 
     async def edit_goal(
-        self, bot: Red, channel: discord.TextChannel, message_id: int, em: discord.Embed
+        self,
+        bot: Red,
+        channel: Union[discord.TextChannel, discord.Thread],
+        message_id: int,
+        em: discord.Embed,
+        text: str,
     ) -> None:
         try:
-            if not channel.permissions_for(channel.guild.me).embed_links:
+            if channel.guild.me.is_timed_out():
                 return
             try:
-                if version_info >= VersionInfo.from_str("3.4.6"):
-                    message = channel.get_partial_message(message_id)
-                else:
-                    message = await channel.fetch_message(message_id)
+                message = channel.get_partial_message(message_id)
             except (discord.errors.NotFound, discord.errors.Forbidden):
                 return
             guild = channel.guild
-            game_day_channels = await bot.get_cog("Hockey").config.guild(guild).gdc()
-            role = discord.utils.get(guild.roles, name=self.team_name + " GOAL")
+            config = bot.get_cog("Hockey").config
+            game_day_channels = await config.guild(guild).gdc()
+            game_day_threads = await config.guild(guild).gdt()
+            guild_image_setting = await config.guild(guild).include_goal_image()
+            channel_image_setting = await config.channel(channel).include_goal_image()
+            include_goal_image = guild_image_setting or channel_image_setting
+            send_em = em.copy()
+            montreal = ["Montréal Canadiens", "Montreal Canadiens"]
+            roles = set()
+            team_role = discord.utils.get(guild.roles, name=f"{self.team_name} GOAL")
+            if team_role is None and self.team_name in montreal:
+                # Special lookup for Canadiens without the accent
+                for name in montreal:
+                    team_role = discord.utils.get(guild.roles, name=f"{name} GOAL")
+                    if team_role is not None:
+                        break
+            if team_role is not None:
+                roles.add(team_role.mention)
+            goal_roles = await config.channel(channel).game_goal_roles()
+            mention_roles = set()
+
+            for team, role_ids in goal_roles.items():
+                if team not in ["all", self.team_name]:
+                    continue
+                for role_id in role_ids:
+                    if role := guild.get_role(role_id):
+                        mention_roles.add(role)
+                        roles.add(role.mention)
+            allowed_mentions = discord.AllowedMentions(roles=list(mention_roles))
+            roles_text = humanize_list(list(roles))
+            if include_goal_image and self.image:
+                send_em.set_image(url=self.image)
+
             if game_day_channels is not None:
                 # We don't want to ping people in the game day channels twice
                 if channel.id in game_day_channels:
                     role = None
-            if role is None or "missed" in self.event.lower():
-                await message.edit(embed=em)
+            if game_day_threads is not None:
+                if channel.id in game_day_threads:
+                    role = None
+            if channel.permissions_for(channel.guild.me).embed_links:
+                if not roles_text or self.type_code.value != 505:  # Goal type_code value
+                    await message.edit(embed=send_em, allowed_mentions=allowed_mentions)
+                else:
+                    await message.edit(content=roles_text, embed=send_em)
             else:
-                await message.edit(content=role.mention, embed=em)
+                if not roles_text or self.type_code.value != 505:  # Goal type_code value
+                    await message.edit(content=text)
+                else:
+                    await message.edit(content=f"{roles_text}\n{text}")
         except (discord.errors.NotFound, discord.errors.Forbidden):
+            log.exception("Apparently could not edit a message")
             return
         except Exception:
             log.exception("Could not edit goal in %s", repr(channel))
@@ -392,53 +542,64 @@ class Goal:
         """
         home_msg = ""
         away_msg = ""
-        score = "☑ {scorer}\n"
-        miss = "❌ {scorer}\n"
-        players = game.home_roster
-        players.update(game.away_roster)
+        score = "\N{WHITE HEAVY CHECK MARK} {scorer}\n"
+        miss = "\N{CROSS MARK} {scorer}\n"
+
         for goal in game.home_goals:
             scorer = ""
             scorer_num = ""
-            if f"ID{goal.scorer_id}" in players:
-                scorer = players[f"ID{goal.scorer_id}"]["person"]["fullName"]
-            if goal.event in ["Shot", "Missed Shot"] and goal.period_ord == "SO":
-                home_msg += miss.format(scorer=scorer)
-            if goal.event in ["Goal"] and goal.period_ord == "SO":
-                home_msg += score.format(scorer=scorer)
+            if goal.period_ord != "SO":
+                continue
+            if goal.goal_id > self.goal_id:
+                continue
+            if goal.scorer_id in game.home_roster:
+                scorer = game.home_roster[goal.scorer_id].name
+                scorer_num = game.home_roster[goal.scorer_id].sweaterNumber
+            if goal.type_code.value in [506, 507]:  # Shots on Goal and Missed Shots
+                home_msg += miss.format(scorer=f"#{scorer_num} {scorer}")
+            if goal.type_code.value in [505]:
+                home_msg += score.format(scorer=f"#{scorer_num} {scorer}")
+
         for goal in game.away_goals:
             scorer = ""
-            if f"ID{goal.scorer_id}" in players:
-                scorer = players[f"ID{goal.scorer_id}"]["person"]["fullName"]
-            if goal.event in ["Shot", "Missed Shot"] and goal.period_ord == "SO":
-                away_msg += miss.format(scorer=scorer)
-            if goal.event in ["Goal"] and goal.period_ord == "SO":
-                away_msg += score.format(scorer=scorer)
+            scorer_num = ""
+            if goal.period_ord != "SO":
+                continue
+            if goal.goal_id > self.goal_id:
+                # if the goal object building this shootout display
+                # is in the shootout and we reach a goal that happened *after*
+                # this goal object, we break for a cleaner looking shootout display.
+
+                # addendum, the new API removed timestamps so for this to work
+                # we have to assume that goal ID's increment
+                continue
+            if goal.scorer_id in game.away_roster:
+                scorer = game.away_roster[goal.scorer_id].name
+                scorer_num = game.away_roster[goal.scorer_id].sweaterNumber
+            if goal.type_code.value in [506, 507]:  # Shots on Goal and Missed Shots
+                away_msg += miss.format(scorer=f"#{scorer_num} {scorer}")
+            if goal.type_code.value in [505]:
+                away_msg += score.format(scorer=f"#{scorer_num} {scorer}")
+
         return home_msg, away_msg
 
-    async def goal_post_embed(self, game: Game) -> discord.Embed:
+    async def goal_post_embed(self, game: Game, *, include_image: bool = False) -> discord.Embed:
         """
         Gets the embed for goal posts
         """
         # h_emoji = game.home_emoji
         # a_emoji = game.away_emoji
         shootout = False
-        if game.period_ord == "SO":
+        if self.period_ord == "SO":
             shootout = True
-        colour = (
-            int(TEAMS[self.team_name]["home"].replace("#", ""), 16)
-            if self.team_name in TEAMS
-            else 0
-        )
-        title = "🚨 {} #{} {} {} 🚨".format(
-            self.team_name, self.jersey_no, self.strength, self.event
-        )
-        url = TEAMS[self.team_name]["team_url"] if self.team_name in TEAMS else "https://nhl.com"
-        logo = TEAMS[self.team_name]["logo"] if self.team_name in TEAMS else "https://nhl.com"
+        colour = self.team.colour
+        title = f"🚨 {self.team_name} #{self.jersey_no} {self.strength} {self.event} 🚨"
+        url = self.team.team_url
+        logo = f"attachment://{self.team.filename}"
         if not shootout:
-
-            em = discord.Embed(description=f"{self.description}\n<t:{self.timestamp}:T>")
+            em = discord.Embed(description=f"{self.description}")
             if self.link:
-                em.description = f"[{self.description}\n<t:{self.timestamp}:T>]({self.link})"
+                em.description = f"[{self.description}]({self.link})"
             if colour is not None:
                 em.colour = colour
             em.set_author(name=title, url=url, icon_url=logo)
@@ -458,25 +619,28 @@ class Goal:
                 ),
                 icon_url=logo,
             )
-            em.timestamp = self.time
+            # em.timestamp = self.time
+            # if self.image is not None:
+            # em.set_image(url=self.image)
         else:
-            if "missed" in self.event.lower():
+            if self.type_code.value != 505:
                 em = discord.Embed(description=self.description, colour=colour)
                 em.set_author(name=title.replace("🚨", ""), url=url, icon_url=logo)
             else:
                 em = discord.Embed(description=self.description, colour=colour)
                 em.set_author(name=title, url=url, icon_url=logo)
             home_msg, away_msg = await self.get_shootout_display(game)
-            em.add_field(name=game.home_team, value=home_msg)
-            em.add_field(name=game.away_team, value=away_msg)
+            if home_msg:
+                em.add_field(name=game.home_team, value=home_msg)
+            if away_msg:
+                em.add_field(name=game.away_team, value=away_msg)
             em.set_footer(
-                text=str(game.period_time_left)
-                + _(" left in the ")
-                + str(game.period_ord)
-                + _(" period"),
+                text=_("{time} left in the {ordinal} period").format(
+                    time=str(game.period_time_left), ordinal=str(self.period_ord)
+                ),
                 icon_url=logo,
             )
-            em.timestamp = self.time
+            # em.timestamp = self.time
         return em
 
     async def goal_post_text(self, game: Game) -> str:
@@ -484,7 +648,12 @@ class Goal:
         Gets the text to send for goal posts
         """
         if game.period_ord != "SO":
-            text = (
+            text = f"🚨 {self.team_name} #{self.jersey_no} {self.strength} {self.event} 🚨\n"
+            if self.link:
+                text += f"[{self.description}]({self.link})\n"
+            else:
+                text += f"{self.description}\n"
+            text += (
                 f"{game.home_emoji} {game.home_team}: {game.home_score}\n"
                 f"{game.away_emoji} {game.away_team}: {game.away_score}\n "
             )

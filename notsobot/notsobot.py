@@ -1,7 +1,6 @@
 # https://github.com/NotSoSuper/NotSoBot
 
 import asyncio
-import logging
 import os
 import random
 import re
@@ -9,8 +8,7 @@ import sys
 import textwrap
 import uuid
 from io import BytesIO
-from typing import List, Optional, Tuple, Union
-from urllib.parse import quote
+from typing import Dict, Optional, Tuple, Union
 
 import aiohttp
 import discord
@@ -22,13 +20,14 @@ import wand.color
 import wand.drawing
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageSequence
 from pyfiglet import figlet_format
+from red_commons.logging import getLogger
 from redbot.core import commands
 from redbot.core.data_manager import bundled_data_path, cog_data_path
 
-from .converter import ImageFinder
+from .converter import ImageFinder, TenorAPI
 from .vw import macintoshplus
 
-log = logging.getLogger("red.trusty-cogs.NotSoBot")
+log = getLogger("red.trusty-cogs.NotSoBot")
 
 try:
     import aalib
@@ -94,7 +93,7 @@ class NotSoBot(commands.Cog):
     """
 
     __author__ = ["NotSoSuper", "TrustyJAID"]
-    __version__ = "2.5.4"
+    __version__ = "2.7.0"
 
     def __init__(self, bot):
         self.bot = bot
@@ -150,6 +149,7 @@ class NotSoBot(commands.Cog):
         )
         self.image_mimes = ["image/png", "image/pjpeg", "image/jpeg", "image/x-icon"]
         self.gif_mimes = ["image/gif"]
+        self.tenor: Optional[TenorAPI] = None
 
     def format_help_for_context(self, ctx: commands.Context) -> str:
         """
@@ -163,6 +163,29 @@ class NotSoBot(commands.Cog):
         Nothing to delete
         """
         return
+
+    async def on_red_api_tokens_update(self, service_name: str, api_tokens: Dict[str, str]):
+        if service_name != "tenor":
+            return
+
+        if "api_key" in api_tokens:
+            if self.tenor is not None:
+                self.tenor._token = api_tokens["api_key"]
+                return
+            self.tenor = TenorAPI(api_tokens["api_key"], str(self.bot.user))
+
+    async def cog_load(self):
+        asyncio.create_task(self.load_tenor())
+
+    async def load_tenor(self):
+        await self.bot.wait_until_red_ready()
+        tokens = await self.bot.get_shared_api_tokens("tenor")
+        if "api_key" in tokens:
+            self.tenor = TenorAPI(tokens["api_key"], str(self.bot.user))
+
+    async def cog_unload(self):
+        if self.tenor:
+            await self.tenor.session.close()
 
     def random_filename(self, image=False, ext: str = "png"):
         h = str(uuid.uuid4().hex)
@@ -193,13 +216,13 @@ class NotSoBot(commands.Cog):
         except Exception as e:
             await channel.send(e)
 
-    async def safe_send(self, ctx, text, file, file_size):
+    async def safe_send(
+        self, ctx: commands.Context, text: Optional[str], file: discord.File, file_size: int
+    ):
         if not ctx.channel.permissions_for(ctx.me).send_messages:
-            file.close()
             return
         if not ctx.channel.permissions_for(ctx.me).attach_files:
             await ctx.send("I don't have permission to attach files.")
-            file.close()
             return
         BASE_FILESIZE_LIMIT = 8388608
         if ctx.guild and file_size < ctx.guild.filesize_limit:
@@ -208,7 +231,6 @@ class NotSoBot(commands.Cog):
             await ctx.send(content=text, file=file)
         else:
             await ctx.send("The contents of this command is too large to upload!")
-        file.close()
 
     @staticmethod
     async def determine_mime_type(image_header: str):
@@ -216,12 +238,21 @@ class NotSoBot(commands.Cog):
             return "image/gif"
         elif "\x89PNG" in image_header:
             return "image/png"
-        elif "\xFF\xD8\xFF" in image_header:
+        elif "\xff\xd8\xff" in image_header:
             return "image/jpeg"
         elif "\x00\x00\x01\x00" in image_header:
             return "image/x-icon"
         else:
-            return None          
+            return None
+
+    async def get_headers(self, url: str) -> Dict[str, str]:
+        headers = {}
+        if "imgur.com" in url:
+            tokens = await self.bot.get_shared_api_tokens("imgur")
+            if "client_id" in tokens:
+                client_id = tokens["client_id"]
+                headers["Authorization"] = f"Client-ID {client_id}"
+        return headers
 
     async def bytes_download(
         self, url: Union[discord.Asset, discord.Attachment, str]
@@ -242,7 +273,8 @@ class NotSoBot(commands.Cog):
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url) as resp:
+                headers = await self.get_headers(url)
+                async with session.get(url, headers=headers) as resp:
                     if resp.status == 200:
                         data = await resp.read()
                         mime = resp.headers.get("Content-type", "").lower()
@@ -250,6 +282,9 @@ class NotSoBot(commands.Cog):
                         b.seek(0)
                         return b, mime
                     else:
+                        log.error(
+                            "%s HTTP Response Error downloading image from %s", resp.status, url
+                        )
                         return False, False
         except asyncio.TimeoutError:
             return False, False
@@ -257,17 +292,14 @@ class NotSoBot(commands.Cog):
             log.error("Error downloading to bytes", exc_info=True)
             return False, False
 
-    def do_magik(self, scale, img):
+    def do_magik(self, scale: int, img: BytesIO):
         img.seek(0)
         try:
             list_imgs = []
             count = 0
             i = wand.image.Image(file=img)
-            img.close()
             i.transform_colorspace("cmyk")
             i.format = "png"
-            if i.size >= (3000, 3000):
-                return ":warning: `Image exceeds maximum resolution >= (3000, 3000).`", None, 0
             count += 1
             i.transform(resize="800x800")
             i.liquid_rescale(
@@ -289,15 +321,12 @@ class NotSoBot(commands.Cog):
             list_imgs.append(magikd)
             filename = self.random_filename(True, "png")
             file = discord.File(list_imgs[0], filename=filename)
-            i.close()
-            for image in list_imgs:
-                image.close()
             return file, file_size
         except Exception:
             log.error("Error processing magik", exc_info=True)
 
     @commands.command(aliases=["imagemagic", "imagemagick", "magic", "magick", "cas", "liquid"])
-    @commands.cooldown(2, 20, commands.BucketType.user)
+    @commands.max_concurrency(1, commands.BucketType.guild)
     async def magik(self, ctx, urls: ImageFinder = None, scale: int = 2, scale_msg: str = ""):
         """
         Apply magik to an image.
@@ -313,22 +342,22 @@ class NotSoBot(commands.Cog):
             if b is False:
                 await ctx.send(":warning: **Command download function failed...**")
                 return
+            loop = asyncio.get_running_loop()
             if mime in self.gif_mimes:
-                task = self.bot.loop.run_in_executor(None, self.do_gmagik, b, 1)
+                task = loop.run_in_executor(None, self.do_gmagik, b, 1)
             else:
-                task = self.bot.loop.run_in_executor(None, self.do_magik, scale, b)
+                task = loop.run_in_executor(None, self.do_magik, scale, b)
             try:
                 file, file_size = await asyncio.wait_for(task, timeout=60)
             except (asyncio.TimeoutError, TypeError):
                 return await ctx.send(
                     "That image is either too large or given image format is unsupported."
                 )
-            if type(file) == str:
+            if isinstance(file, str):
                 await ctx.send(file)
                 return
 
             await self.safe_send(ctx, scale_msg, file, file_size)
-            b.close()
 
     def do_gmagik(self, image, frame_delay):
         final = BytesIO()
@@ -339,7 +368,7 @@ class NotSoBot(commands.Cog):
                 if len(getattr(img, "sequence", [])) > 1:
                     is_gif = True
                 if is_gif:
-                    log.debug("Is gif")
+                    log.verbose("Is gif")
                     for change in img.sequence:
                         change.transform(resize="512x512")
                         change.liquid_rescale(
@@ -360,7 +389,7 @@ class NotSoBot(commands.Cog):
                     # for i in range(len(img.sequence)):
                     # with img.sequence[i] as change:
                 else:
-                    log.debug("Is not gif")
+                    log.verbose("Is not gif")
                     for x in range(0, 30):
                         if x == 0:
                             log.debug("Cloning initial image")
@@ -390,14 +419,10 @@ class NotSoBot(commands.Cog):
             final.seek(0)
         filename = self.random_filename(True, "gif")
         file = discord.File(final, filename=filename)
-        img.close()
-        image.close()
-        new_image.close()
-        final.close()
         return file, file_size
 
     @commands.command()
-    @commands.cooldown(1, 20, commands.BucketType.guild)
+    @commands.max_concurrency(1, commands.BucketType.guild)
     @commands.bot_has_permissions(attach_files=True)
     async def gmagik(self, ctx, urls: ImageFinder = None, frame_delay: int = 1):
         """Attempt to do magik on a gif"""
@@ -414,10 +439,11 @@ class NotSoBot(commands.Cog):
             if b is False:
                 await ctx.send(":warning: **Command download function failed...**")
                 return
+            loop = asyncio.get_running_loop()
             if mime in self.gif_mimes:
-                task = self.bot.loop.run_in_executor(None, self.do_gmagik, b, frame_delay)
+                task = loop.run_in_executor(None, self.do_gmagik, b, frame_delay)
             else:
-                task = self.bot.loop.run_in_executor(None, self.do_magik, 2, b)
+                task = loop.run_in_executor(None, self.do_magik, 2, b)
             try:
                 file, file_size = await asyncio.wait_for(task, timeout=120)
             except asyncio.TimeoutError:
@@ -431,7 +457,86 @@ class NotSoBot(commands.Cog):
                 await msg.delete()
             except discord.errors.NotFound:
                 pass
-        b.close()
+
+    @commands.command()
+    @commands.bot_has_permissions(attach_files=True)
+    async def petimg(
+        self,
+        ctx: commands.Context,
+        urls: ImageFinder = None,
+    ) -> None:
+        """
+        Add petting to an image
+
+        - `[urls=None]` The thing you want to add petting to.
+        """
+
+        if urls is None:
+            urls = await ImageFinder().search_for_images(ctx)
+        url = urls[0]
+        async with ctx.channel.typing():
+            try:
+                b, mime = await self.bytes_download(url)
+                if b is False:
+                    await ctx.send("I could not download that image.")
+                    return
+                loop = asyncio.get_running_loop()
+                image = Image.open(b)
+                task = loop.run_in_executor(None, self.petpet_maker, image)
+            except Exception as e:
+                log.error(e)
+                await ctx.send("There was an issue getting the template file.")
+                return
+            try:
+                file, file_size = await asyncio.wait_for(task, timeout=120)
+            except asyncio.TimeoutError:
+                await ctx.send("Processing the image took too long.")
+                return
+            except Exception:
+                log.exception("Error generating pet image.")
+                await ctx.send("There was an error generating pet image.")
+                return
+        await self.safe_send(ctx, None, file, file_size)
+
+    def petpet_maker(self, base: Image.Image) -> Tuple[discord.File, int]:
+        images = []
+        resolution = (128, 128)
+
+        frames = 10
+        temp = BytesIO()
+        base = base.resize(resolution).convert("RGBA")
+        for i in range(frames):
+            squeeze = i if i < frames / 2 else frames - i
+            width = 0.8 + squeeze * 0.02
+            height = 0.8 - squeeze * 0.05
+            offsetX = (1 - width) * 0.5 + 0.1
+            offsetY = (1 - height) - 0.08
+
+            canvas = Image.new("RGBA", size=resolution, color=(0, 0, 0, 0))
+            canvas.paste(
+                base.resize((round(width * resolution[0]), round(height * resolution[1]))),
+                (round(offsetX * resolution[0]), round(offsetY * resolution[1])),
+            )
+            pet = (
+                Image.open(bundled_data_path(self).joinpath("petpet").joinpath(f"pet{i}.gif"))
+                .convert("RGBA")
+                .resize(resolution)
+            )
+            canvas.paste(pet, mask=pet)
+            images.append(canvas)
+        images[0].save(
+            temp,
+            format="GIF",
+            save_all=True,
+            append_images=images,
+            duration=20,
+            loop=0,
+            disposal=2,
+            optimize=True,
+        )
+        temp.seek(0)
+        file = discord.File(temp, filename="petimage.gif")
+        return file, temp.tell()
 
     @commands.command()
     @commands.bot_has_permissions(attach_files=True)
@@ -502,24 +607,21 @@ class NotSoBot(commands.Cog):
                                 new_image.sequence.append(frame)
                             new_image.save(file=final)
                     i.save(file=final)
-                    i.close()
                 file_size = final.tell()
                 final.seek(0)
                 filename = f"caption.{'png' if not is_gif else 'gif'}"
                 file = discord.File(final, filename=filename)
-                final.close()
                 return file, file_size
 
-            task = ctx.bot.loop.run_in_executor(
+            loop = asyncio.get_running_loop()
+            task = loop.run_in_executor(
                 None, make_caption_image, b, text, color, font, x, y, is_gif
             )
             try:
                 file, file_size = await asyncio.wait_for(task, timeout=60)
             except asyncio.TimeoutError:
                 return await ctx.send("That image is too large.")
-            b.close()
             await ctx.send(file=file)
-            file.close()
 
     def trigger_image(self, path: BytesIO, t_path: BytesIO) -> Tuple[discord.File, int]:
         final = BytesIO()
@@ -559,44 +661,58 @@ class NotSoBot(commands.Cog):
             for frame in img.sequence:
                 frame.delay = 2
             img.save(file=final)
-            img.close()
         file_size = final.tell()
         final.seek(0)
         filename = self.random_filename(True, "gif")
         file = discord.File(final, filename=filename)
-        final.close()
         return file, file_size
 
     @commands.command()
-    @commands.cooldown(1, 5)
+    @commands.max_concurrency(1, commands.BucketType.guild)
     @commands.bot_has_permissions(attach_files=True)
     async def triggered(self, ctx, urls: ImageFinder = None):
         """Generate a Triggered GIF for a user or image"""
         if urls is None:
-            urls = [ctx.author.avatar_url_as(format="png")]
+            urls = [ctx.author.display_avatar.replace(format="png").url]
         avatar = urls[0]
         async with ctx.typing():
             img, mime = await self.bytes_download(str(avatar))
-            trig, mime = await self.bytes_download("https://i.imgur.com/zDAY2yo.jpg")
+            img_path = cog_data_path(self) / "triggered.jpg"
+            if not os.path.isfile(img_path) or os.path.getsize(img_path) == 0:
+                url = "https://i.imgur.com/zDAY2yo.jpg"
+                trig, mime = await self.bytes_download(url)
+                if trig is not False:
+                    with img_path.open("wb") as outfile:
+                        outfile.write(trig.read())
+                else:
+                    await ctx.send(
+                        "There was an error downloading the triggered template. "
+                        "If you are the bot owner check your logs for instructions to fix this."
+                    )
+                    log.info("Please visit %s and save this image at `%s`.", url, img_path)
+                    return
+            with img_path.open("rb") as infile:
+                trig = BytesIO(infile.read())
             if img is False or trig is False:
                 await ctx.send(":warning: **Command download function failed...**")
                 return
             try:
-                task = ctx.bot.loop.run_in_executor(None, self.trigger_image, img, trig)
+                loop = asyncio.get_running_loop()
+                task = loop.run_in_executor(None, self.trigger_image, img, trig)
                 file, file_size = await asyncio.wait_for(task, timeout=60)
             except asyncio.TimeoutError:
                 return await ctx.send("Error creating trigger image")
             await self.safe_send(ctx, None, file, file_size)
-            img.close()
 
     @commands.command(aliases=["aes"])
+    @commands.max_concurrency(1, commands.BucketType.guild)
     @commands.bot_has_permissions(attach_files=True)
     async def aesthetics(self, ctx, *, text: str):
         """Returns inputed text in aesthetics"""
         final = ""
         pre = " ".join(text)
         for char in pre:
-            if not ord(char) in range(33, 127):
+            if ord(char) not in range(33, 127):
                 final += char
                 continue
             final += chr(ord(char) + 65248)
@@ -608,25 +724,26 @@ class NotSoBot(commands.Cog):
             img = ImageDraw.Draw(i)
             txt = figlet_format(text, font="starwars")
             img.text((20, 20), figlet_format(text, font="starwars"), fill=(0, 255, 0))
-            text_width, text_height = img.textsize(figlet_format(text, font="starwars"))
+            size = img.textbbox((0, 0), figlet_format(text, font="starwars"))
+            text_width, text_height = (size[2] - size[0], size[3] - size[1])
             imgs = Image.new("RGB", (text_width + 30, text_height))
             ii = ImageDraw.Draw(imgs)
             ii.text((20, 20), figlet_format(text, font="starwars"), fill=(0, 255, 0))
-            text_width, text_height = ii.textsize(figlet_format(text, font="starwars"))
+            size = ii.textbbox((0, 0), figlet_format(text, font="starwars"))
+            text_width, text_height = (size[2] - size[0], size[3] - size[1])
             final = BytesIO()
             imgs.save(final, "png")
             file_size = final.tell()
             final.seek(0)
             filename = self.random_filename(True, "png")
             file = discord.File(final, filename=filename)
-            final.close()
-            imgs.close()
             return file, txt, file_size
         except Exception:
-            return False, False
+            log.exception("Error making ascii text")
+            return False, False, False
 
     @commands.command(aliases=["expand"])
-    @commands.cooldown(1, 5)
+    @commands.max_concurrency(1, commands.BucketType.guild)
     @commands.bot_has_permissions(attach_files=True)
     async def ascii(self, ctx, *, text: str):
         """Convert text into ASCII"""
@@ -636,7 +753,8 @@ class NotSoBot(commands.Cog):
         if text == "donger" or text == "dong":
             text = "8====D"
         async with ctx.typing():
-            task = self.bot.loop.run_in_executor(None, self.do_ascii, text)
+            loop = asyncio.get_running_loop()
+            task = loop.run_in_executor(None, self.do_ascii, text)
             try:
                 file, txt, file_size = await asyncio.wait_for(task, timeout=60)
             except asyncio.TimeoutError:
@@ -671,15 +789,13 @@ class NotSoBot(commands.Cog):
         for lines in screen.render().splitlines():
             draw.text((0, y), lines, (0, 0, 0), font=font)
             y += 15
-        imagefit = ImageOps.fit(img, (image_width, image_height), Image.ANTIALIAS)
+        ImageOps.fit(img, (image_width, image_height), Image.ANTIALIAS)
 
         final = BytesIO()
         img.save(final, "png")
         file_size = final.tell()
         final.seek(0)
         # file = discord.File(final, filename="iascii.png")
-        # final.close()
-        img.close()
         return final, file_size
 
     async def check_font_file(self):
@@ -696,7 +812,7 @@ class NotSoBot(commands.Cog):
                     save_file.write(data)
 
     @commands.command()
-    @commands.cooldown(1, 5, commands.BucketType.user)
+    @commands.max_concurrency(1, commands.BucketType.guild)
     @commands.check(lambda ctx: AALIB_INSTALLED)
     @commands.bot_has_permissions(attach_files=True)
     async def iascii(self, ctx, urls: ImageFinder = None):
@@ -716,7 +832,8 @@ class NotSoBot(commands.Cog):
                 await ctx.send(":warning: **Command download function failed...**")
                 return
             im = Image.open(b)
-            task = self.bot.loop.run_in_executor(None, self.generate_ascii, im)
+            loop = asyncio.get_running_loop()
+            task = loop.run_in_executor(None, self.generate_ascii, im)
             try:
                 temp, file_size = await asyncio.wait_for(task, timeout=60)
             except (asyncio.TimeoutError, PIL.UnidentifiedImageError):
@@ -725,7 +842,6 @@ class NotSoBot(commands.Cog):
                 )
             filename = self.random_filename(True, "png")
             file = discord.File(temp, filename)
-            temp.close()
             await self.safe_send(ctx, None, file, file_size)
 
     def do_gascii(self, b):
@@ -742,19 +858,19 @@ class NotSoBot(commands.Cog):
                 img_list.append(img)
                 count += 1
             temp = BytesIO()
-            img.save(temp, format="GIF", save_all=True, append_images=img_list, duration=0, loop=0)
+            img.save(
+                temp, format="GIF", save_all=True, append_images=img_list, duration=20, loop=0
+            )
             file_size = temp.tell()
             temp.seek(0)
             filename = self.random_filename(True, "gif")
             file = discord.File(temp, filename=filename)
-            temp.close()
-            image.close()
             return file, file_size
         except Exception:
             raise
 
     @commands.command()
-    @commands.cooldown(1, 10, commands.BucketType.guild)
+    @commands.max_concurrency(1, commands.BucketType.guild)
     @commands.check(lambda ctx: AALIB_INSTALLED)
     @commands.bot_has_permissions(attach_files=True)
     async def gascii(self, ctx, urls: ImageFinder = None):
@@ -771,7 +887,8 @@ class NotSoBot(commands.Cog):
             if b is False:
                 await ctx.send(":warning: **Command download function failed...**")
                 return
-            result = self.bot.loop.run_in_executor(None, self.do_gascii, b)
+            loop = asyncio.get_running_loop()
+            result = loop.run_in_executor(None, self.do_gascii, b)
             try:
                 file, file_size = await asyncio.wait_for(result, timeout=60)
             except asyncio.TimeoutError:
@@ -783,22 +900,34 @@ class NotSoBot(commands.Cog):
 
     @commands.command()
     @commands.bot_has_permissions(attach_files=True)
+    @commands.max_concurrency(1, commands.BucketType.guild)
     async def rip(self, ctx, name: str = None, *, text: str = None):
         """Generate tombstone image with name and optional text"""
         if name is None:
             name = ctx.message.author.name
         if len(ctx.message.mentions) >= 1:
             name = ctx.message.mentions[0].name
-        b, mime = await self.bytes_download("https://i.imgur.com/xNWxZHn.jpg")
-        if b is False:
-            await ctx.send(":warning: **Command download function failed...**")
-            return
+        # b, mime = await self.bytes_download()
+        img_path = cog_data_path(self) / "rip.jpg"
+        if not os.path.isfile(img_path) or os.path.getsize(img_path) == 0:
+            url = "https://i.imgur.com/xNWxZHn.jpg"
+            img, mime = await self.bytes_download(url)
+            if img is not False:
+                with img_path.open("wb") as outfile:
+                    outfile.write(img.read())
+            else:
+                await ctx.send(
+                    "There was an error downloading the triggered template. "
+                    "If you are the bot owner check your logs for instructions to fix this."
+                )
+                log.info("Please visit %s and save this image at `%s`.", url, img_path)
+                return
+        with img_path.open("rb") as infile:
+            image = BytesIO(infile.read())
         if not text:
             text = f"{name}'s\n Hopes and Dreams"
         else:
             text = f"{name}\n{text}"
-        if not b:
-            return
 
         def make_rip(image, text):
             img = Image.open(image).convert("RGB")
@@ -806,7 +935,8 @@ class NotSoBot(commands.Cog):
             font_path = f"{str(bundled_data_path(self))}{os.sep}arial.ttf"
             font1 = ImageFont.truetype(font_path, 35)
             text = "\n".join(line for line in textwrap.wrap(text, width=15))
-            w, h = draw.multiline_textsize(text, font=font1)
+            size = draw.multiline_textbbox((0, 0), text, font=font1)
+            w = size[2] - size[1]
             draw.multiline_text(
                 (((400 - w) / 2) - 1, 50), text, fill=(50, 50, 50), font=font1, align="center"
             )
@@ -828,12 +958,10 @@ class NotSoBot(commands.Cog):
             final.seek(0)
             filename = self.random_filename(True, "jpg")
             file = discord.File(final, filename=filename)
-            final.close()
-            img.close()
-            b.close()
             return file, file_size
 
-        task = ctx.bot.loop.run_in_executor(None, make_rip, b, text)
+        loop = asyncio.get_running_loop()
+        task = loop.run_in_executor(None, make_rip, image, text)
         try:
             file, file_size = await asyncio.wait_for(task, timeout=60)
         except asyncio.TimeoutError:
@@ -841,7 +969,7 @@ class NotSoBot(commands.Cog):
         await self.safe_send(ctx, None, file, file_size)
 
     @commands.command()
-    @commands.cooldown(1, 5)
+    @commands.max_concurrency(1, commands.BucketType.guild)
     @commands.bot_has_permissions(attach_files=True)  # ImageFinder consumes rest this is so goat'd
     async def merge(self, ctx, vertical: Optional[bool] = True, *, urls: Optional[ImageFinder]):
         """
@@ -862,7 +990,7 @@ class NotSoBot(commands.Cog):
             count = 0
             list_im = []
             for url in urls:
-                log.debug(url)
+                log.verbose("merge url: %s", url)
                 count += 1
                 b, mime = await self.bytes_download(str(url))
                 if sys.getsizeof(b) == 215:
@@ -889,15 +1017,12 @@ class NotSoBot(commands.Cog):
                 final.seek(0)
                 filename = self.random_filename(True, "png")
                 file = discord.File(final, filename=filename)
-                final.close()
-                for i in imgs:
-                    i.close()
-                imgs_comb.close()
                 return file, file_size
 
             if len(list_im) < 2:
                 return await ctx.send("You need to supply more than 1 image.")
-            task = ctx.bot.loop.run_in_executor(None, make_merge, list_im)
+            loop = asyncio.get_running_loop()
+            task = loop.run_in_executor(None, make_merge, list_im)
             try:
                 file, file_size = await asyncio.wait_for(task, timeout=60)
             except (asyncio.TimeoutError, PIL.UnidentifiedImageError):
@@ -905,7 +1030,6 @@ class NotSoBot(commands.Cog):
                     "That image is either too large or image filetype is unsupported."
                 )
             await self.safe_send(ctx, None, file, file_size)
-            b.close()
 
     @commands.command()
     async def emojify(self, ctx, *, txt: str):
@@ -929,7 +1053,7 @@ class NotSoBot(commands.Cog):
             return await self.bot.get_embed_colour(channel)
 
     @commands.command(aliases=["needsmorejpeg", "jpegify", "magik2"])
-    @commands.cooldown(2, 5, commands.BucketType.user)
+    @commands.max_concurrency(1, commands.BucketType.guild)
     @commands.bot_has_permissions(attach_files=True)
     async def jpeg(self, ctx, urls: Optional[ImageFinder] = None, quality: int = 1):
         """
@@ -960,11 +1084,10 @@ class NotSoBot(commands.Cog):
                 final.seek(0)
                 filename = self.random_filename(True, "jpg")
                 file = discord.File(final, filename=filename)
-                final.close()
-                img.close()
                 return file, file_size
 
-            task = ctx.bot.loop.run_in_executor(None, make_jpeg, b)
+            loop = asyncio.get_running_loop()
+            task = loop.run_in_executor(None, make_jpeg, b)
             try:
                 file, file_size = await asyncio.wait_for(task, timeout=60)
             except (asyncio.TimeoutError, PIL.UnidentifiedImageError):
@@ -972,7 +1095,6 @@ class NotSoBot(commands.Cog):
                     "That image is either too large or image filetype is unsupported."
                 )
             await self.safe_send(ctx, None, file, file_size)
-            b.close()
 
     def do_vw(self, b, txt):
         im = Image.open(b)
@@ -984,12 +1106,10 @@ class NotSoBot(commands.Cog):
         final.seek(0)
         filename = self.random_filename(True, "png")
         file = discord.File(final, filename=filename)
-        final.close()
-        im.close()
         return file, file_size
 
     @commands.command(aliases=["vaporwave", "vape", "vapewave"])
-    @commands.cooldown(2, 5)
+    @commands.max_concurrency(1, commands.BucketType.guild)
     @commands.bot_has_permissions(attach_files=True)
     async def vw(self, ctx, urls: ImageFinder = None, *, txt: str = None):
         """Add vaporwave flavours to an image"""
@@ -1003,7 +1123,8 @@ class NotSoBot(commands.Cog):
             await ctx.send(":warning: **Command download function failed...**")
             return
         try:
-            task = self.bot.loop.run_in_executor(None, self.do_vw, b, txt)
+            loop = asyncio.get_running_loop()
+            task = loop.run_in_executor(None, self.do_vw, b, txt)
             file, file_size = await asyncio.wait_for(task, timeout=60)
         except asyncio.TimeoutError:
             return await ctx.send("That image is too large.")
@@ -1011,16 +1132,28 @@ class NotSoBot(commands.Cog):
             log.error("Error in vaporwave: ", exc_info=True)
             return await ctx.send("That image cannot be vaporwaved.")
         await self.safe_send(ctx, None, file, file_size)
-        b.close()
 
     @commands.command(aliases=["achievement"])
     @commands.bot_has_permissions(attach_files=True)
+    @commands.max_concurrency(1, commands.BucketType.guild)
     async def minecraftachievement(self, ctx, *, txt: str):
         """Generate a Minecraft Achievement"""
-        b, mime = await self.bytes_download("https://i.imgur.com/JtNJFZy.png")
-        if b is False:
-            await ctx.send(":warning: **Command download function failed...**")
-            return
+        img_path = cog_data_path(self) / "achievement.png"
+        if not os.path.isfile(img_path) or os.path.getsize(img_path) == 0:
+            url = "https://i.imgur.com/JtNJFZy.png"
+            img, mime = await self.bytes_download(url)
+            if img is not False:
+                with img_path.open("wb") as outfile:
+                    outfile.write(img.read())
+            else:
+                await ctx.send(
+                    "There was an error downloading the triggered template. "
+                    "If you are the bot owner check your logs for instructions to fix this."
+                )
+                log.info("Please visit %s and save this image at `%s`.", url, img_path)
+                return
+        with img_path.open("rb") as infile:
+            image = BytesIO(infile.read())
         if len(txt) > 20:
             txt = txt[:20] + " ..."
 
@@ -1036,22 +1169,21 @@ class NotSoBot(commands.Cog):
             final.seek(0)
             filename = self.random_filename(True, "png")
             file = discord.File(final, filename=filename)
-            final.close()
-            image.close()
             return file, file_size
 
         try:
-            task = self.bot.loop.run_in_executor(None, make_mc, b, txt)
+            loop = asyncio.get_running_loop()
+            task = loop.run_in_executor(None, make_mc, image, txt)
             file, file_size = await asyncio.wait_for(task, timeout=60)
         except asyncio.TimeoutError:
             return await ctx.send("That image is too large.")
         except Exception:
             return await ctx.send("I cannot make that minecraft achievement.")
         await self.safe_send(ctx, None, file, file_size)
-        b.close()
 
     @commands.command(aliases=["wm"])
     @commands.bot_has_permissions(attach_files=True)
+    @commands.max_concurrency(1, commands.BucketType.guild)
     async def watermark(
         self,
         ctx,
@@ -1094,7 +1226,22 @@ class NotSoBot(commands.Cog):
             ):
                 return await ctx.send("That is not a valid image.")
             if mark == "brazzers" or mark is None:
-                wmm, mime = await self.bytes_download("https://i.imgur.com/YAb1RMZ.png")
+                img_path = cog_data_path(self) / "brazzers.png"
+                if not os.path.isfile(img_path) or os.path.getsize(img_path) == 0:
+                    url = "https://i.imgur.com/YAb1RMZ.png"
+                    img, mime = await self.bytes_download(url)
+                    if img is not False:
+                        with img_path.open("wb") as outfile:
+                            outfile.write(img.read())
+                    else:
+                        await ctx.send(
+                            "There was an error downloading the triggered template. "
+                            "If you are the bot owner check your logs for instructions to fix this."
+                        )
+                        log.info("Please visit %s and save this image at `%s`.", url, img_path)
+                        return
+                with img_path.open("rb") as infile:
+                    wmm = BytesIO(infile.read())
                 if wmm is False or b is False:
                     await ctx.send(":warning: **Command download function failed...**")
                     return
@@ -1126,8 +1273,6 @@ class NotSoBot(commands.Cog):
                                     image=wm, left=final_x, top=final_y, transparency=transparency
                                 )
                             new_img.save(file=final)
-                            new_img.close()
-                            wm.close()
 
                     elif is_gif and not wm_gif:
                         log.debug("The base image is a gif")
@@ -1146,9 +1291,6 @@ class NotSoBot(commands.Cog):
                                     )
                                     new_image.sequence.append(frame)
                             new_image.save(file=final)
-                            new_image.close()
-                            new_img.close()
-                            wm.close()
                     else:
                         log.debug("The mark is a gif")
                         with wand.image.Image() as new_image:
@@ -1176,39 +1318,33 @@ class NotSoBot(commands.Cog):
                                             new_frame.delay = frame.delay
 
                             new_image.save(file=final)
-                            new_image.close()
-                            new_img.close()
 
                 size = final.tell()
                 final.seek(0)
                 filename = f"watermark.{'gif' if is_gif or wm_gif else 'png'}"
                 file = discord.File(final, filename=filename)
-                final.close()
-                img.close()
                 return file, size
 
             try:
-                task = ctx.bot.loop.run_in_executor(
+                loop = asyncio.get_running_loop()
+                task = loop.run_in_executor(
                     None, add_watermark, b, wmm, x, y, transparency, wm_gif
                 )
                 file, file_size = await asyncio.wait_for(task, timeout=120)
             except asyncio.TimeoutError:
                 return await ctx.send("That image is too large.")
             await self.safe_send(ctx, None, file, file_size)
-            b.close()
-            wmm.close()
 
     def do_glitch(self, b, amount, seed, iterations):
         img = Image.open(b)
-        is_gif = ((hasattr(img, "is_animated")) and (img.is_animated))
+        is_gif = (hasattr(img, "is_animated")) and (img.is_animated)
         if not is_gif:
             image = img.convert("RGB")
             img_bytes = BytesIO()
             image.save(img_bytes, format="JPEG")
             img_bytes.seek(0)
-            image = jpglitch.Jpeg(bytearray(img_bytes.getvalue()), amount, seed, iterations)
-            img_bytes.close()
             final = BytesIO()
+            image = jpglitch.Jpeg(bytearray(img_bytes.getvalue()), amount, seed, iterations)
             final.name = self.random_filename(True, "jpg")
             image.save_image(final)
             file_size = final.tell()
@@ -1230,13 +1366,10 @@ class NotSoBot(commands.Cog):
             file_size = final.tell()
             filename = self.random_filename(True, "gif")
             file = discord.File(final, filename=filename)
-        b.close()
-        final.close()
-        img.close()
         return file, file_size
 
     @commands.command(aliases=["jpglitch"])
-    @commands.cooldown(2, 5)
+    @commands.max_concurrency(1, commands.BucketType.guild)
     @commands.bot_has_permissions(attach_files=True)
     async def glitch(
         self,
@@ -1263,7 +1396,8 @@ class NotSoBot(commands.Cog):
             if b is False:
                 await ctx.send(":warning: **Command download function failed...**")
                 return
-            task = self.bot.loop.run_in_executor(None, self.do_glitch, b, amount, seed, iterations)
+            loop = asyncio.get_running_loop()
+            task = loop.run_in_executor(None, self.do_glitch, b, amount, seed, iterations)
             try:
                 file, file_size = await asyncio.wait_for(task, timeout=60)
             except (asyncio.TimeoutError, PIL.UnidentifiedImageError):
@@ -1273,10 +1407,10 @@ class NotSoBot(commands.Cog):
 
             msg = f"Iterations: `{iterations}` | Amount: `{amount}` | Seed: `{seed}`"
             await self.safe_send(ctx, msg, file, file_size)
-            b.close()
 
     @commands.command(aliases=["pixel"])
     @commands.bot_has_permissions(attach_files=True)
+    @commands.max_concurrency(1, commands.BucketType.guild)
     async def pixelate(self, ctx, urls: ImageFinder = None, pixels: int = 9):
         """Pixelate an image"""
         if urls is None:
@@ -1289,20 +1423,20 @@ class NotSoBot(commands.Cog):
                 if len(img_urls) > 1:
                     await ctx.send(":warning: **Command download function failed...**")
                     return
+            loop = asyncio.get_running_loop()
             if mime in self.gif_mimes:
-                task = ctx.bot.loop.run_in_executor(None, self.make_pixel_gif, b, pixels)
+                task = loop.run_in_executor(None, self.make_pixel_gif, b, pixels)
             else:
-                task = ctx.bot.loop.run_in_executor(None, self.make_pixel, b, pixels)
+                task = loop.run_in_executor(None, self.make_pixel, b, pixels)
             try:
                 file, file_size = await asyncio.wait_for(task, timeout=60)
             except asyncio.TimeoutError:
                 return await ctx.send("The image is too large.")
             await self.safe_send(ctx, None, file, file_size)
-            b.close()
 
     def make_pixel(self, b: BytesIO, pixels: int) -> Tuple[discord.File, int]:
         bg = (0, 0, 0)
-        img = Image.open(b)
+        img = Image.open(b).convert("RGBA")
         img = img.resize((int(img.size[0] / pixels), int(img.size[1] / pixels)), Image.NEAREST)
         img = img.resize((int(img.size[0] * pixels), int(img.size[1] * pixels)), Image.NEAREST)
         load = img.load()
@@ -1317,16 +1451,12 @@ class NotSoBot(commands.Cog):
         final.seek(0)
         filename = self.random_filename(True, "png")
         file = discord.File(final, filename=filename)
-        b.close()
-        final.close()
-        img.close()
         return file, file_size
 
     def make_pixel_gif(self, b, pixels):
         try:
-            image = Image.open(b)
+            image = Image.open(b).convert("RGBA")
             gif_list = [frame.copy() for frame in ImageSequence.Iterator(image)]
-            image.close()
         except IOError:
             return ":warning: Cannot load gif."
         bg = (0, 0, 0)
@@ -1344,16 +1474,11 @@ class NotSoBot(commands.Cog):
                         load[i, j + r] = bg
             img_list.append(img)
         final = BytesIO()
-        img.save(final, format="GIF", save_all=True, append_images=img_list, duration=0, loop=0)
+        img.save(final, format="GIF", save_all=True, append_images=img_list, duration=20, loop=0)
         file_size = final.tell()
         final.seek(0)
         filename = self.random_filename(True, "gif")
         file = discord.File(final, filename=filename)
-        b.close()
-        final.close()
-        img.close()
-        for image_file in img_list:
-            image_file.close()
         return file, file_size
 
     def do_waaw(self, b):
@@ -1368,9 +1493,6 @@ class NotSoBot(commands.Cog):
             h2.flop()
             h1.save(file=f)
             h2.save(file=f2)
-            h1.close()
-            h2.close()
-            b.close()
         f.seek(0)
         f2.seek(0)
         list_im = [f, f2]
@@ -1384,16 +1506,11 @@ class NotSoBot(commands.Cog):
         final.seek(0)
         filename = self.random_filename(True, "png")
         file = discord.File(final, filename=filename)
-        f.close()
-        f2.close()
-        final.close()
-        for image_file in list_im:
-            image_file.close()
         return file, file_size
 
     # Thanks to Iguniisu#9746 for the idea
     @commands.command(aliases=["magik3", "mirror"])
-    @commands.cooldown(2, 5, commands.BucketType.user)
+    @commands.max_concurrency(1, commands.BucketType.guild)
     @commands.bot_has_permissions(attach_files=True)
     async def waaw(self, ctx, urls: ImageFinder = None):
         """Mirror an image vertically right to left"""
@@ -1405,7 +1522,8 @@ class NotSoBot(commands.Cog):
             if b is False:
                 await ctx.send(":warning: **Command download function failed...**")
                 return
-            task = self.bot.loop.run_in_executor(None, self.do_waaw, b)
+            loop = asyncio.get_running_loop()
+            task = loop.run_in_executor(None, self.do_waaw, b)
             try:
                 file, file_size = await asyncio.wait_for(task, timeout=60)
             except (asyncio.TimeoutError, wand.exceptions.MissingDelegateError):
@@ -1413,7 +1531,6 @@ class NotSoBot(commands.Cog):
                     "The image is either too large or you're missing delegates for this image format."
                 )
             await self.safe_send(ctx, None, file, file_size)
-            b.close()
 
     def do_haah(self, b):
         f = BytesIO()
@@ -1427,9 +1544,6 @@ class NotSoBot(commands.Cog):
             h2.flop()
             h1.save(file=f)
             h2.save(file=f2)
-            h1.close()
-            h2.close()
-            b.close()
         f.seek(0)
         f2.seek(0)
         list_im = [f2, f]
@@ -1443,15 +1557,10 @@ class NotSoBot(commands.Cog):
         final.seek(0)
         filename = self.random_filename(True, "png")
         file = discord.File(final, filename=filename)
-        f.close()
-        f2.close()
-        final.close()
-        for image_file in list_im:
-            image_file.close()
         return file, file_size
 
     @commands.command(aliases=["magik4", "mirror2"])
-    @commands.cooldown(2, 5, commands.BucketType.user)
+    @commands.max_concurrency(1, commands.BucketType.guild)
     @commands.bot_has_permissions(attach_files=True)
     async def haah(self, ctx, urls: ImageFinder = None):
         """Mirror an image vertically left to right"""
@@ -1463,7 +1572,8 @@ class NotSoBot(commands.Cog):
             if b is False:
                 await ctx.send(":warning: **Command download function failed...**")
                 return
-            task = self.bot.loop.run_in_executor(None, self.do_haah, b)
+            loop = asyncio.get_running_loop()
+            task = loop.run_in_executor(None, self.do_haah, b)
             try:
                 file, file_size = await asyncio.wait_for(task, timeout=60)
             except (asyncio.TimeoutError, wand.exceptions.MissingDelegateError):
@@ -1471,7 +1581,6 @@ class NotSoBot(commands.Cog):
                     "The image is either too large or you're missing delegates for this image format."
                 )
             await self.safe_send(ctx, None, file, file_size)
-            b.close()
 
     def do_woow(self, b):
         f = BytesIO()
@@ -1486,9 +1595,6 @@ class NotSoBot(commands.Cog):
             h2.rotate(degree=180)
             h1.save(file=f)
             h2.save(file=f2)
-            h1.close()
-            h2.close()
-            b.close()
         f.seek(0)
         f2.seek(0)
         list_im = [f, f2]
@@ -1502,15 +1608,10 @@ class NotSoBot(commands.Cog):
         final.seek(0)
         filename = self.random_filename(True, "png")
         file = discord.File(final, filename=filename)
-        f.close()
-        f2.close()
-        final.close()
-        for image_file in list_im:
-            image_file.close()
         return file, file_size
 
     @commands.command(aliases=["magik5", "mirror3"])
-    @commands.cooldown(2, 5, commands.BucketType.user)
+    @commands.max_concurrency(1, commands.BucketType.guild)
     @commands.bot_has_permissions(attach_files=True)
     async def woow(self, ctx, urls: ImageFinder = None):
         """Mirror an image horizontally top to bottom"""
@@ -1522,7 +1623,8 @@ class NotSoBot(commands.Cog):
             if b is False:
                 await ctx.send(":warning: **Command download function failed...**")
                 return
-            task = self.bot.loop.run_in_executor(None, self.do_woow, b)
+            loop = asyncio.get_running_loop()
+            task = loop.run_in_executor(None, self.do_woow, b)
             try:
                 file, file_size = await asyncio.wait_for(task, timeout=60)
             except (asyncio.TimeoutError, wand.exceptions.MissingDelegateError):
@@ -1530,7 +1632,6 @@ class NotSoBot(commands.Cog):
                     "The image is either too large or you're missing delegates for this image format."
                 )
             await self.safe_send(ctx, None, file, file_size)
-            b.close()
 
     def do_hooh(self, b):
         f = BytesIO()
@@ -1546,9 +1647,6 @@ class NotSoBot(commands.Cog):
             h2.flop()
             h1.save(file=f)
             h2.save(file=f2)
-            h1.close()
-            h2.close()
-            b.close()
         f.seek(0)
         f2.seek(0)
         list_im = [f, f2]
@@ -1562,15 +1660,10 @@ class NotSoBot(commands.Cog):
         final.seek(0)
         filename = self.random_filename(True, "png")
         file = discord.File(final, filename=filename)
-        f.close()
-        f2.close()
-        final.close()
-        for image_file in list_im:
-            image_file.close()
         return file, file_size
 
     @commands.command(aliases=["magik6", "mirror4"])
-    @commands.cooldown(2, 5, commands.BucketType.user)
+    @commands.max_concurrency(1, commands.BucketType.guild)
     @commands.bot_has_permissions(attach_files=True)
     async def hooh(self, ctx, urls: ImageFinder = None):
         """Mirror an image horizontally bottom to top"""
@@ -1582,7 +1675,8 @@ class NotSoBot(commands.Cog):
             if b is False:
                 await ctx.send(":warning: **Command download function failed...**")
                 return
-            task = self.bot.loop.run_in_executor(None, self.do_hooh, b)
+            loop = asyncio.get_running_loop()
+            task = loop.run_in_executor(None, self.do_hooh, b)
             try:
                 file, file_size = await asyncio.wait_for(task, timeout=60)
             except (asyncio.TimeoutError, wand.exceptions.MissingDelegateError):
@@ -1590,10 +1684,10 @@ class NotSoBot(commands.Cog):
                     "The image is either too large or you're missing delegates for this image format."
                 )
             await self.safe_send(ctx, None, file, file_size)
-            b.close()
 
     @commands.command()
     @commands.bot_has_permissions(attach_files=True)
+    @commands.max_concurrency(1, commands.BucketType.guild)
     async def flipimg(self, ctx, urls: ImageFinder = None):
         """Rotate an image 180 degrees"""
         if urls is None:
@@ -1608,17 +1702,16 @@ class NotSoBot(commands.Cog):
             def flip_img(b):
                 with Image.open(b) as img:
                     image = ImageOps.flip(img)
-                    img.close()
                 with BytesIO() as final:
                     image.save(final, "png")
                     file_size = final.tell()
                     final.seek(0)
                     filename = self.random_filename(True, "png")
                     file = discord.File(final, filename=filename)
-                    final.close()
                 return file, file_size
 
-            task = ctx.bot.loop.run_in_executor(None, flip_img, b)
+            loop = asyncio.get_running_loop()
+            task = loop.run_in_executor(None, flip_img, b)
             try:
                 file, file_size = await asyncio.wait_for(task, timeout=60)
             except (asyncio.TimeoutError, PIL.UnidentifiedImageError):
@@ -1626,10 +1719,10 @@ class NotSoBot(commands.Cog):
                     "The image is either too large or image filetype is unsupported."
                 )
             await self.safe_send(ctx, None, file, file_size)
-            b.close()
 
     @commands.command()
     @commands.bot_has_permissions(attach_files=True)
+    @commands.max_concurrency(1, commands.BucketType.guild)
     async def flop(self, ctx, urls: ImageFinder = None):
         """Flip an image horizontally"""
         if urls is None:
@@ -1650,19 +1743,19 @@ class NotSoBot(commands.Cog):
                     final.seek(0)
                     filename = self.random_filename(True, "png")
                     file = discord.File(final, filename=filename)
-                    image.close()
                 return file, file_size
 
-            task = ctx.bot.loop.run_in_executor(None, flop_img, b)
+            loop = asyncio.get_running_loop()
+            task = loop.run_in_executor(None, flop_img, b)
             try:
                 file, file_size = await asyncio.wait_for(task, timeout=60)
             except asyncio.TimeoutError:
                 return await ctx.send("That image is too large.")
             await self.safe_send(ctx, None, file, file_size)
-            b.close()
 
     @commands.command(aliases=["inverse", "negate"])
     @commands.bot_has_permissions(attach_files=True)
+    @commands.max_concurrency(1, commands.BucketType.guild)
     async def invert(self, ctx, urls: ImageFinder = None):
         """Invert the colours of an image"""
         if urls is None:
@@ -1683,10 +1776,10 @@ class NotSoBot(commands.Cog):
                     final.seek(0)
                     filename = self.random_filename(True, "png")
                     file = discord.File(final, filename=filename)
-                    image.close()
                 return file, file_size
 
-            task = ctx.bot.loop.run_in_executor(None, invert_img, b)
+            loop = asyncio.get_running_loop()
+            task = loop.run_in_executor(None, invert_img, b)
             try:
                 file, file_size = await asyncio.wait_for(task, timeout=60)
             except (asyncio.TimeoutError, PIL.UnidentifiedImageError):
@@ -1694,10 +1787,10 @@ class NotSoBot(commands.Cog):
                     "That image is either too large or image filetype is unsupported."
                 )
             await self.safe_send(ctx, None, file, file_size)
-            b.close()
 
     @commands.command()
     @commands.bot_has_permissions(attach_files=True)
+    @commands.max_concurrency(1, commands.BucketType.guild)
     async def rotate(self, ctx, degrees: int = 90, urls: ImageFinder = None):
         """Rotate image X degrees"""
         if urls is None:
@@ -1717,10 +1810,10 @@ class NotSoBot(commands.Cog):
                     final.seek(0)
                     filename = self.random_filename(True, "png")
                     file = discord.File(final, filename=filename)
-                    image.close()
                 return file, file_size
 
-            task = ctx.bot.loop.run_in_executor(None, rotate_img, b, degrees)
+            loop = asyncio.get_running_loop()
+            task = loop.run_in_executor(None, rotate_img, b, degrees)
             try:
                 file, file_size = await asyncio.wait_for(task, timeout=60)
             except (asyncio.TimeoutError, PIL.UnidentifiedImageError):
@@ -1728,4 +1821,3 @@ class NotSoBot(commands.Cog):
                     "That image is either too large or image filetype is unsupported."
                 )
             await self.safe_send(ctx, f"Rotated: `{degrees}°`", file, file_size)
-            b.close()

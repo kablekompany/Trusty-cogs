@@ -1,24 +1,26 @@
-import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import aiohttp
 import discord
+from red_commons.logging import getLogger
+from redbot import VersionInfo, version_info
 from redbot.core import commands
 from redbot.core.i18n import Translator
-from redbot.core.utils.chat_formatting import humanize_list
-from redbot.core.utils.menus import start_adding_reactions
+from redbot.core.utils.chat_formatting import bold, humanize_list
 
-from .abc import MixinMeta
-from .constants import TEAMS
+from .abc import HockeyMixin
 from .game import Game
-from .helper import HockeyStates, HockeyTeams, utc_to_local
+from .helper import StateFinder, TeamFinder, get_chn_name, get_team_role
 
-log = logging.getLogger("red.trusty-cogs.Hockey")
+log = getLogger("red.trusty-cogs.Hockey")
 
 _ = Translator("Hockey", __file__)
 
+hockey_commands = HockeyMixin.hockey_commands
 
-class GameDayChannels(MixinMeta):
+
+class GameDayChannels(HockeyMixin):
     """
     All the commands grouped under `[p]gdc`
     """
@@ -27,7 +29,7 @@ class GameDayChannels(MixinMeta):
     # GDC Commands                                                        #
     #######################################################################
 
-    @commands.group()
+    @hockey_commands.group(with_app_command=False)
     @commands.mod_or_permissions(manage_channels=True)
     @commands.guild_only()
     async def gdc(self, ctx: commands.Context) -> None:
@@ -44,6 +46,9 @@ class GameDayChannels(MixinMeta):
         """
         Show the current Game Day Channel Settings
         """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         async with ctx.typing():
             guild = ctx.message.guild
             create_channels = await self.config.guild(guild).create_channels()
@@ -52,10 +57,11 @@ class GameDayChannels(MixinMeta):
             team = await self.config.guild(guild).gdc_team()
             if team is None:
                 team = "None"
-            channels = await self.config.guild(guild).gdc()
+            channels = (await self.config.guild(guild).gdc_chans()).values()
             category = guild.get_channel(await self.config.guild(guild).category())
             delete_gdc = await self.config.guild(guild).delete_gdc()
             game_states = await self.config.guild(guild).gdc_state_updates()
+            countdown = await self.config.guild(guild).gdc_countdown()
             if category is not None:
                 category = category.name
             if channels is not None:
@@ -74,7 +80,8 @@ class GameDayChannels(MixinMeta):
                 msg = _(
                     "```GDC settings for {guild}\nCreate Game Day Channels: {create_channels}"
                     "\nDelete Game Day Channels: {delete_gdc}\nTeam: {team}\n"
-                    "Current Channels: {created_channels}\nDefault Game State: {game_states}\n```"
+                    "Current Threads: {created_threads}\nDefault Game State: {game_states}\n"
+                    "Game Start Countdown: {countdown}\n```"
                 ).format(
                     guild=guild.name,
                     create_channels=create_channels,
@@ -82,6 +89,7 @@ class GameDayChannels(MixinMeta):
                     team=team,
                     created_channels=created_channels,
                     game_states=humanize_list(game_states),
+                    countdown=countdown,
                 )
 
                 await ctx.send(msg)
@@ -95,6 +103,7 @@ class GameDayChannels(MixinMeta):
                 if not game_states:
                     game_states = ["None"]
                 em.add_field(name=_("Default Game States"), value=humanize_list(game_states))
+                em.add_field(name=_("Game Start Countdown"), value=str(countdown))
                 await ctx.send(embed=em)
 
     @gdc.command(name="delete")
@@ -102,11 +111,14 @@ class GameDayChannels(MixinMeta):
         """
         Delete all current game day channels for the server
         """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         await self.delete_gdc(ctx.guild)
         await ctx.send(_("Game day channels deleted."))
 
     @gdc.command(name="defaultstate")
-    async def gdc_default_game_state(self, ctx: commands.Context, *state: HockeyStates) -> None:
+    async def gdc_default_game_state(self, ctx: commands.Context, state: StateFinder) -> None:
         """
         Set the default game state updates for Game Day Channels.
 
@@ -117,31 +129,88 @@ class GameDayChannels(MixinMeta):
         `final` is the final game update including 3 stars.
         `goal` is all the goal updates.
         """
-        await self.config.guild(ctx.guild).gdc_state_updates.set(list(set(state)))
-        if state:
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
+        cur_state = await self.config.guild(ctx.guild).gdc_state_updates()
+        added = []
+        removed = []
+        if state.value in cur_state:
+            removed.append(state.value)
+            cur_state.remove(state.value)
+        else:
+            added.append(state.value)
+            cur_state.append(state.value)
+        await self.config.guild(ctx.guild).gdc_state_updates.set(cur_state)
+        if cur_state:
+            msg = _("GDC game updates set to {states}").format(
+                states=humanize_list(list(set(cur_state)))
+            )
+            if added:
+                msg += "\n" + _("{states} was added.").format(states=bold(humanize_list(added)))
+            if removed:
+                msg += "\n" + _("{states} was removed.").format(
+                    states=bold(humanize_list(removed))
+                )
+            await ctx.send(msg)
+        else:
+            msg = _("GDC game updates not set")
+            await ctx.send(msg)
+
+    @gdc.command(name="countdown")
+    @commands.mod_or_permissions(manage_channels=True)
+    async def set_gdc_countdown_updates(
+        self,
+        ctx: commands.Context,
+    ) -> None:
+        """
+        Toggle 60, 30, and 10 minute countdown updates in game day channels
+        """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
+        current = await self.config.guild(ctx.guild).gdc_countdown()
+        await self.config.guild(ctx.guild).gdc_countdown.set(not current)
+        if current:
             await ctx.send(
-                _("GDC game updates set to {states}").format(
-                    states=humanize_list(list(set(state)))
+                _(
+                    "60, 30, and 10 minute countdown messages have been disabled in future game day channels."
                 )
             )
         else:
-            await ctx.send(_("GDC game updates not set"))
+            await ctx.send(
+                _(
+                    "60, 30, and 10 minute countdown messages have been enabled in future game day channels."
+                )
+            )
 
     @gdc.command(name="create")
     async def gdc_create(self, ctx: commands.Context) -> None:
         """
         Creates the next gdc for the server
         """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         if not await self.config.guild(ctx.guild).gdc_team():
-            return await ctx.send(_("No team was setup for game day channels in this server."))
+            await ctx.send(_("No team was setup for game day channels in this server."))
+            return
         if await self.config.guild(ctx.guild).create_channels():
-            await self.create_gdc(ctx.guild)
+            try:
+                await self.create_gdc(ctx.guild)
+            except aiohttp.ClientConnectorError:
+                await ctx.send(
+                    _("There's an issue accessing the NHL API at the moment. Try again later.")
+                )
+                log.exception("Error accessing NHL API")
+                return
         else:
-            return await ctx.send(
+            await ctx.send(
                 _("You need to first toggle channel creation with `{prefix}gdc toggle`.").format(
                     prefix=ctx.clean_prefix
                 )
             )
+            return
         await ctx.send(_("Game day channels created."))
 
     @gdc.command(name="toggle")
@@ -149,7 +218,18 @@ class GameDayChannels(MixinMeta):
         """
         Toggles the game day channel creation on this server
         """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         guild = ctx.message.guild
+        if await self.config.guild(guild).create_threads():
+            await ctx.send(
+                _(
+                    "You cannot have both game day channels and game day threads in the same server. "
+                    "Use `{prefix}{command}` first to disable game day threads then try again."
+                ).format(prefix=ctx.clean_prefix, command=self.gdt_toggle.qualified_name)
+            )
+            return
         cur_setting = not await self.config.guild(guild).create_channels()
         verb = _("will") if cur_setting else _("won't")
         msg = _("Game day channels ") + verb + _(" be created on this server.")
@@ -161,6 +241,9 @@ class GameDayChannels(MixinMeta):
         """
         Change the category for channel creation. Channel is case sensitive.
         """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         guild = ctx.message.guild
 
         # cur_setting = await self.config.guild(guild).category()
@@ -174,6 +257,9 @@ class GameDayChannels(MixinMeta):
         """
         Toggle's auto deletion of game day channels.
         """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         guild = ctx.message.guild
 
         cur_setting = await self.config.guild(guild).delete_gdc()
@@ -185,12 +271,15 @@ class GameDayChannels(MixinMeta):
         await self.config.guild(guild).delete_gdc.set(not cur_setting)
         await ctx.send(msg)
 
-    @gdc.command(name="test")
+    @gdc.command(name="test", with_app_command=False)
     @commands.is_owner()
     async def test_gdc(self, ctx: commands.Context) -> None:
         """
         Test checking for new game day channels
         """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         await self.check_new_gdc()
         await ctx.tick()
 
@@ -199,7 +288,7 @@ class GameDayChannels(MixinMeta):
     async def gdc_setup(
         self,
         ctx: commands.Context,
-        team: HockeyTeams,
+        team: TeamFinder,
         category: discord.CategoryChannel = None,
         delete_gdc: bool = True,
     ) -> None:
@@ -216,82 +305,121 @@ class GameDayChannels(MixinMeta):
         `[delete_gdc=True]` will tell the bot whether or not to delete game day channels automatically
         must be either `True` or `False`. Defaults to `True` if not provided.
         """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         guild = ctx.message.guild
+        if await self.config.guild(guild).create_threads():
+            await ctx.send(
+                _(
+                    "You cannot have both game day channels and game day threads in the same server. "
+                    "Use `{prefix}{command}` first to disable game day threads then try again."
+                ).format(prefix=ctx.clean_prefix, command=self.gdt_toggle.qualified_name)
+            )
+            return
         if team is None:
-            return await ctx.send(_("You must provide a valid current team."))
+            await ctx.send(_("You must provide a valid current team."))
+            return
         if category is None and ctx.channel.category is not None:
             category = guild.get_channel(ctx.channel.category_id)
-        else:
-            return await ctx.send(
+        if category is None:
+            await ctx.send(
                 _("You must specify a channel category for game day channels to be created under.")
             )
+            return
         if not category.permissions_for(guild.me).manage_channels:
             await ctx.send(_("I don't have manage channels permission!"))
             return
+        await self.clear_gdc(guild)
         await self.config.guild(guild).category.set(category.id)
         await self.config.guild(guild).gdc_team.set(team)
         await self.config.guild(guild).delete_gdc.set(delete_gdc)
         await self.config.guild(guild).create_channels.set(True)
+        made = False
         if team.lower() != "all":
-            await self.create_gdc(guild)
+            try:
+                await self.create_gdc(guild)
+            except aiohttp.ClientConnectorError:
+                await ctx.send(
+                    _("There's an issue accessing the NHL API at the moment. Try again later.")
+                )
+                log.exception("Error accessing NHL API")
+                return
         else:
-            game_list = await Game.get_games(session=self.session)
-            for game in game_list:
-                await self.create_gdc(guild, game)
-        await ctx.send(_("Game Day Channels for ") + team + _(" setup in ") + category.name)
+            try:
+                schedule = await self.api.get_schedule()
+            except aiohttp.ClientConnectorError:
+                await ctx.send(
+                    _("There's an issue accessing the NHL API at the moment. Try again later.")
+                )
+                log.exception("Error accessing NHL API")
+                return
+            # log.debug("Games list is %s", game_list)
+            found_games = False
+            for scheduled_day in schedule.days:
+                if not scheduled_day:
+                    # look for the next closest game instead of making a whole week's worth
+                    continue
+                for scheduled_game in scheduled_day:
+                    if scheduled_game.game_state == "Postponed":
+                        log.debug("Game %s is postponed", scheduled_game)
+                        continue
+                    if (scheduled_game.game_start - datetime.now(timezone.utc)) > timedelta(
+                        days=7
+                    ):
+                        log.debug("Game %s game start is more than 7 days ago", scheduled_game)
+                        continue
+                    game = await self.api.get_game_from_id(scheduled_game.id)
+                    made = await self.create_gdc(guild, game)
+                    found_games = True
+                if found_games:
+                    break
+        if made:
+            msg = _("Game Day channels for {team} setup in {channel}").format(
+                team=team, channel=category.mention
+            )
+        else:
+            msg = _("Something went wrong creating game day channels.")
+        await ctx.send(msg)
 
     #######################################################################
     # GDC logic                                                           #
     #######################################################################
 
-    async def get_chn_name(self, game: Game) -> str:
-        """
-        Creates game day channel name
-        """
-        timestamp = utc_to_local(game.game_start)
-        chn_name = "{}-vs-{}-{}-{}-{}".format(
-            game.home_abr, game.away_abr, timestamp.year, timestamp.month, timestamp.day
-        )
-        return chn_name.lower()
-
     async def check_new_gdc(self) -> None:
-        game_list = await Game.get_games(
-            session=self.session
-        )  # Do this once so we don't spam the api
+        game_list = await self.api.get_games()  # Do this once so we don't spam the api
         for guilds in await self.config.all_guilds():
             guild = self.bot.get_guild(guilds)
             if guild is None:
                 continue
             if not await self.config.guild(guild).create_channels():
                 continue
+            if guild.me.is_timed_out():
+                continue
             team = await self.config.guild(guild).gdc_team()
             if team != "all":
-                next_games = await Game.get_games_list(team, datetime.now(), session=self.session)
+                next_games = await self.api.get_games(team, datetime.now())
                 next_game = None
                 if next_games != []:
-                    next_game = await Game.from_url(next_games[0]["link"], session=self.session)
+                    next_game = next_games[0]
                 if next_game is None:
                     continue
-                chn_name = await self.get_chn_name(next_game)
-                try:
-                    cur_channels = await self.config.guild(guild).gdc()
-                    if cur_channels:
-                        cur_channel = self.bot.get_channel(cur_channels[0])
-                    else:
-                        cur_channel = None
-                        # this is dumb but eh
-                except Exception:
-                    log.error("Error checking new GDC", exc_info=True)
-                    cur_channel = None
+                if (next_game.game_start - datetime.now(timezone.utc)) > timedelta(days=7):
+                    continue
+                cur_channels = await self.config.guild(guild).gdc_chans()
+                cur_channel = guild.get_channel(cur_channels.get(str(next_game.game_id)))
+
                 if cur_channel is None:
-                    await self.create_gdc(guild)
-                elif cur_channel.name != chn_name.lower():
                     await self.delete_gdc(guild)
                     await self.create_gdc(guild)
 
             else:
                 await self.delete_gdc(guild)
                 for game in game_list:
+                    if game.game_state == "Postponed":
+                        continue
+                    if (game.game_start - datetime.now(timezone.utc)) > timedelta(days=7):
+                        continue
                     await self.create_gdc(guild, game)
 
     async def create_gdc(self, guild: discord.Guild, game_data: Optional[Game] = None) -> None:
@@ -308,22 +436,20 @@ class GameDayChannels(MixinMeta):
             # Return none if there's no category to create the channel
             return
         if not category.permissions_for(guild.me).manage_channels:
-            log.info(
-                f"Cannot create new GDC in {repr(guild)} due to too many missing permissions."
-            )
+            log.info("Cannot create new GDC in %r due to too many missing permissions.", guild)
             return
         if len(category.channels) >= 50:
-            log.info(
-                f"Cannot create new GDC in {repr(guild)} due to too many channels in category."
-            )
+            log.info("Cannot create new GDC in %r due to too many channels in category.", guild)
             return
         if game_data is None:
             team = await self.config.guild(guild).gdc_team()
 
-            next_games = await Game.get_games_list(team, datetime.now(), session=self.session)
+            next_games = await self.api.get_games(team, datetime.now())
             if next_games != []:
-                next_game = await Game.from_url(next_games[0]["link"], session=self.session)
+                next_game = next_games[0]
                 if next_game is None:
+                    return
+                if (next_game.game_start - datetime.now(timezone.utc)) > timedelta(days=7):
                     return
             else:
                 # Return if no more games are playing for this team
@@ -332,16 +458,17 @@ class GameDayChannels(MixinMeta):
             team = game_data.home_team
             next_game = game_data
 
-        chn_name = await self.get_chn_name(next_game)
+        chn_name = get_chn_name(next_game)
         try:
             new_chn = await guild.create_text_channel(chn_name, category=category)
         except discord.Forbidden:
-            log.error(f"Error creating channel in {repr(guild)}")
+            log.error("Error creating channel in %r", guild)
+            return
         except Exception:
             log.exception(f"Error creating channels in {repr(guild)}")
             return
-        async with self.config.guild(guild).gdc() as current_gdc:
-            current_gdc.append(new_chn.id)
+        async with self.config.guild(guild).gdc_chans() as current_gdc:
+            current_gdc[str(next_game.game_id)] = new_chn.id
         # await config.guild(guild).create_channels.set(True)
         await self.config.channel(new_chn).team.set([team])
         await self.config.channel(new_chn).guild_id.set(guild.id)
@@ -349,14 +476,33 @@ class GameDayChannels(MixinMeta):
         await self.config.channel(new_chn).to_delete.set(delete_gdc)
         gdc_state_updates = await self.config.guild(guild).gdc_state_updates()
         await self.config.channel(new_chn).game_states.set(gdc_state_updates)
+        gdc_countdown = await self.config.guild(guild).gdc_countdown()
+        await self.config.channel(new_chn).countdown.set(gdc_countdown)
+
+        # Set default notification settings on the newly created channel
+        start_roles = await self.config.guild(guild).default_start_roles()
+        await self.config.channel(new_chn).game_start_roles.set(start_roles)
+        state_roles = await self.config.guild(guild).default_state_roles()
+        await self.config.channel(new_chn).game_state_roles.set(state_roles)
+        goal_roles = await self.config.guild(guild).default_goal_roles()
+        await self.config.channel(new_chn).game_goal_roles.set(goal_roles)
+
         # Gets the timezone to use for game day channel topic
         # timestamp = datetime.strptime(next_game.game_start, "%Y-%m-%dT%H:%M:%SZ")
         # guild_team = await config.guild(guild).gdc_team()
         time_string = f"<t:{next_game.timestamp}:F>"
+        home_role = get_team_role(guild, next_game.home_team)
+        away_role = get_team_role(guild, next_game.away_team)
+        home_role_mention = next_game.home_team
+        away_role_mention = next_game.away_team
+        if home_role:
+            home_role_mention = home_role.mention
+        if away_role:
+            away_role_mention = away_role.mention
 
         game_msg = (
-            f"{next_game.away_team} {next_game.away_emoji} @ "
-            f"{next_game.home_team} {next_game.home_emoji} {time_string}"
+            f"{away_role_mention} {next_game.away_emoji} @ "
+            f"{home_role_mention} {next_game.home_emoji} {time_string}"
         )
         try:
             await new_chn.edit(topic=game_msg)
@@ -365,48 +511,58 @@ class GameDayChannels(MixinMeta):
         if new_chn.permissions_for(guild.me).embed_links:
             em = await next_game.game_state_embed()
             try:
-                preview_msg = await new_chn.send(embed=em)
+                preview_msg = await new_chn.send(game_msg, embed=em)
             except Exception:
                 log.error("Error posting game preview in GDC channel.")
         else:
             try:
-                preview_msg = await new_chn.send(await next_game.game_state_text())
+                game_text = await next_game.game_state_text()
+                text_message = f"{game_msg}\n{game_text}"
+                preview_msg = await new_chn.send(text_message)
             except Exception:
                 log.error("Error posting game preview in GDC channel.")
                 return
+        if version_info < VersionInfo.from_str("3.5.23"):
+            pin_perms = new_chn.permissions_for(guild.me).manage_messages
+        else:
+            pin_perms = new_chn.permissions_for(guild.me).pin_messages
+        if pin_perms:
+            try:
+                await preview_msg.pin()
+            except discord.errors.Forbidden:
+                log.info("Missing permission to pin messages in %r", new_chn)
+            except Exception:
+                log.exception("Error pinning message in %r", new_chn)
 
-        # Create new pickems object for the game
-        try:
-            await self.create_pickem_object(guild, preview_msg, new_chn, next_game)
-        except Exception:
-            log.error("Error creating pickems object in GDC channel.")
-
-        if new_chn.permissions_for(guild.me).manage_messages:
-            await preview_msg.pin()
-        if new_chn.permissions_for(guild.me).add_reactions:
-            start_adding_reactions(
-                preview_msg, [next_game.away_emoji[2:-1], next_game.home_emoji[2:-1]]
-            )
+    async def clear_gdc(self, guild: discord.Guild) -> None:
+        """
+        Rather than delete the threads we will now purge our local data only
+        since it's no longer necessary to keep and threads will be automatically
+        archived
+        """
+        channels = await self.config.guild(guild).gdc_chans()
+        for channel in channels.values():
+            await self.config.channel_from_id(channel).clear()
+        await self.config.guild(guild).gdc_chans.clear()
 
     async def delete_gdc(self, guild: discord.Guild) -> None:
         """
         Deletes all game day channels in a given guild
         """
-        channels = await self.config.guild(guild).gdc()
+        channels = await self.config.guild(guild).gdc_chans()
         if channels is None:
-            channels = []
-        for channel in channels:
-            chn = guild.get_channel(channel)
-            if chn is None:
-                await self.config.channel_from_id(channel).clear()
-                continue
-            if not await self.config.channel(chn).to_delete():
-                continue
-            try:
-                await self.config.channel(chn).clear()
-                await chn.delete()
-            except discord.errors.Forbidden:
-                log.error(f"Cannot delete GDC channels in {guild.id} due to permissions issue.")
-            except Exception:
-                log.exception(f"Cannot delete GDC channels in {guild.id}")
-        await self.config.guild(guild).gdc.clear()
+            channels = {}
+        for channel in channels.values():
+            if await self.config.channel_from_id(channel).to_delete():
+                chn = guild.get_channel(channel)
+                if chn is not None:
+                    try:
+                        await chn.delete()
+                    except discord.errors.Forbidden:
+                        log.error(
+                            "Cannot delete GDC channels in %s due to permissions issue.", guild.id
+                        )
+                    except Exception:
+                        log.exception(f"Cannot delete GDC channels in {guild.id}")
+            await self.config.channel_from_id(channel).clear()
+        await self.config.guild(guild).gdc_chans.clear()

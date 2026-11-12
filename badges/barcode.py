@@ -9,8 +9,8 @@ import gzip
 import os
 import string
 import xml.dom
-import logging
 
+from red_commons.logging import getLogger
 from redbot.core.data_manager import bundled_data_path
 
 try:
@@ -31,7 +31,7 @@ try:
 except NameError:
     _strbase = str
 
-log = logging.getLogger("red.Trusty-cogs.badges")
+log = getLogger("red.Trusty-cogs.badges")
 
 
 def mm2px(mm, dpi=300):
@@ -349,8 +349,9 @@ class SVGWriter(BaseWriter):
         attributes = dict(
             x=SIZE.format(xpos),
             y=SIZE.format(ypos),
-            style="fill:{0};font-size:{1}pt;text-anchor:"
-            "middle;".format(self.foreground, self.font_size),
+            style="fill:{0};font-size:{1}pt;text-anchor:middle;".format(
+                self.foreground, self.font_size
+            ),
         )
         _set_attributes(element, **attributes)
         # check option to override self.text with self.human (barcode as human readable data, can be used to print own formats)
@@ -410,7 +411,8 @@ else:
 
         def _paint_text(self, xpos, ypos):
             font = ImageFont.truetype(self.FONT, self.font_size * 2)
-            width, height = font.getsize(self.text)
+            top, left, bottom, right = font.getbbox(text=self.text)
+            width, height = (bottom - top, right - left)
             pos = (mm2px(xpos, self.dpi) - width // 2, mm2px(ypos, self.dpi) - height // 4)
             self._draw.text(pos, self.text, font=font, fill=self.foreground)
 
@@ -424,7 +426,6 @@ else:
 
 
 class Barcode(object):
-
     name = ""
 
     raw = None
@@ -524,8 +525,9 @@ def check_code(code, name, allowed):
             wrong.append(char)
     if wrong:
         raise IllegalCharacterError(
-            "The following characters are not "
-            "valid for {name}: {wrong}".format(name=name, wrong=", ".join(wrong))
+            "The following characters are not valid for {name}: {wrong}".format(
+                name=name, wrong=", ".join(wrong)
+            )
         )
 
 
@@ -582,7 +584,7 @@ def get_barcode(name, code=None, writer=None):
     try:
         barcode = Code39
     except KeyError:
-        raise BarcodeNotFoundError("The barcode {0!r} you requested is not " "known.".format(name))
+        raise BarcodeNotFoundError("The barcode {0!r} you requested is not known.".format(name))
     if code is not None:
         return barcode(code, writer)
     return barcode

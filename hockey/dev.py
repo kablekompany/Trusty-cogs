@@ -1,37 +1,91 @@
-import discord
 import json
-import logging
-from datetime import date, datetime, timedelta
+import os
+import re
+from datetime import date, datetime, timedelta, timezone
+from hashlib import md5
+from io import BytesIO
+from pathlib import Path
+from typing import Optional
 
+import aiohttp
+import discord
+from red_commons.logging import getLogger
 from redbot.core import commands
-from redbot.core.bot import Red
+from redbot.core.data_manager import cog_data_path
 from redbot.core.i18n import Translator
 from redbot.core.utils import AsyncIter
-from redbot.core.utils.chat_formatting import pagify
+from redbot.core.utils.chat_formatting import humanize_list, pagify
 
-from .abc import MixinMeta
+from .abc import HockeyMixin
 from .constants import TEAMS
-from .errors import InvalidFileError
 from .game import Game
 from .helper import get_channel_obj
 from .menu import BaseMenu, SimplePages
 from .pickems import Pickems
 from .standings import Standings
 
-try:
-    from .oilers import Oilers
-
-    LIGHTS_SET = True
-except ImportError:
-    LIGHTS_SET = False
-    pass
-
 _ = Translator("Hockey", __file__)
 
-log = logging.getLogger("red.trusty-cogs.hockey")
+log = getLogger("red.trusty-cogs.hockey")
+
+try:
+    from cairosvg import svg2png
+
+    CAIRO = True
+    from PIL import Image, ImageOps
+
+except ImportError:
+    log.error("Cairosvg or pillow are not installed so we can't save team logos.")
+    CAIRO = False
+
+try:
+    from PIL import features
+
+    WEBP = features.check("webp")
+except Exception:
+    WEBP = False
 
 
-class HockeyDev(MixinMeta):
+class TeamLogo:
+    def __init__(self, data: bytes, name: str, background: str, logos_path: Path):
+        self.data = data
+        self.name = name
+        self.background = background
+        self.logos_path = logos_path
+        self.emoji: Optional[BytesIO] = None
+        self.filename = re.sub(r"[^A-Za-z0-9\_]", "", f"{self.name}_{self.background}")
+
+    async def check(self) -> bool:
+        temp = BytesIO()
+        svg2png(self.data, write_to=temp, parent_width=960, parent_height=960)
+        self.image = Image.open(temp).convert("RGBA")
+        bbox = self.image.getbbox()
+        crop = self.image.crop(bbox)
+        new_img = ImageOps.pad(crop.copy(), (960, 960), Image.Resampling.LANCZOS, (0, 0, 0, 0))
+        file_format = "webp" if WEBP else "png"
+
+        logo_path = self.logos_path.joinpath(f"{self.filename}.{file_format}")
+        if os.path.isfile(logo_path) and os.path.getsize(logo_path) != 0:
+            with logo_path.open("rb") as oldfile:
+                old_hash = md5(oldfile.read()).hexdigest()
+            new_hash_temp = BytesIO()
+            new_img.save(new_hash_temp, format=file_format)
+            new_hash_temp.seek(0)
+            new_hash = md5(new_hash_temp.read()).hexdigest()
+            equal = old_hash == new_hash
+            if old_hash == new_hash:
+                log.debug("Old: %s - New: %s - EQ: %s", old_hash, new_hash, equal)
+                return False
+
+        new_img.save(logo_path, format=file_format)
+        emoji_img = ImageOps.pad(crop.copy(), (128, 128), Image.Resampling.LANCZOS, (0, 0, 0, 0))
+        emoji_temp = BytesIO()
+        emoji_img.save(emoji_temp, format="PNG")
+        emoji_temp.seek(0)
+        return True
+
+
+class HockeyDev(HockeyMixin):
     """
     All the commands grouped under `[p]hockeydev`
     """
@@ -40,7 +94,7 @@ class HockeyDev(MixinMeta):
     # Owner Only Commands Mostly for Testing and debuggings               #
     #######################################################################
 
-    @commands.group(aliases=["nhldev"])
+    @commands.group(aliases=["nhldev"], with_app_command=False)
     @commands.is_owner()
     async def hockeydev(self, ctx: commands.Context) -> None:
         """
@@ -51,7 +105,99 @@ class HockeyDev(MixinMeta):
         """
         pass
 
-    @hockeydev.command(name="resetpickemsweekly")
+    @hockeydev.group(name="cleanup")
+    async def cleanup(self, ctx: commands.Context):
+        """
+        Cleanup saved channels/guilds that no longer exist.
+        """
+
+    @cleanup.command(name="guilds")
+    async def cleanup_guilds(self, ctx: commands.Context):
+        """
+        Check for missing guilds and clear their data
+        """
+        all_guilds = await self.config.all_guilds()
+        for guild_id in all_guilds:
+            if not self.bot.get_guild(guild_id):
+                await self.config.guild_from_id(guild_id).clear()
+        await ctx.tick(message="Done.")
+
+    @cleanup.command(name="channels")
+    async def cleanup_channels(self, ctx: commands.Context):
+        """
+        Check for missing guilds and clear their data
+        """
+        all_channels = await self.config.all_channels()
+        for channel_id, data in all_channels.items():
+            channel = await get_channel_obj(self.bot, channel_id, data)
+            if channel is None:
+                await self.config.channel_from_id(channel_id).clear()
+        await ctx.tick(message="Done.")
+
+    @hockeydev.command(name="errorchannel")
+    async def set_loop_error_channel(self, ctx: commands.Context, channel: discord.TextChannel):
+        """
+        Specify an error channel for the hockey loop.
+        """
+        if not channel.permissions_for(ctx.me).send_messages:
+            await ctx.send(
+                "I need permission to send messages in {channel}".format(channel=channel.mention)
+            )
+            return
+        await self.config.loop_error_channel.set(channel.id)
+        await self.config.loop_error_guild.set(channel.guild.id)
+        await ctx.send(
+            "I will attempt to send error messages in {channel}.".format(channel=channel.mention)
+        )
+
+    @hockeydev.command(with_app_command=False)
+    async def getgoals(self, ctx: commands.Context) -> None:
+        """
+        Testing function with testgame.json
+        """
+        # to_remove = []
+        # games_playing = True
+        # log.debug(link)
+        with open("/mnt/e/github/Trusty-cogs/hockey/testgame.json", "r") as infile:
+            data = json.loads(infile.read())
+        log.verbose("getgoals testgame.json data: %s", data)
+        game = await Game.from_json(data)
+        await game.check_game_state(self.bot)
+        if (game.home_score + game.away_score) != 0:
+            await game.check_team_goals(self.bot)
+        all_teams = await self.config.teams()
+        for team in await self.config.teams():
+            if team["team_name"] in [game.home_team, game.away_team]:
+                all_teams.remove(team)
+                team["goal_id"] = {}
+                team["game_state"] = "Null"
+                team["game_start"] = ""
+                team["period"] = 0
+                all_teams.append(team)
+
+        await self.config.teams.set(all_teams)
+        await ctx.send("Done testing.")
+
+    @hockeydev.group(name="pickems", with_app_command=False)
+    async def pickems_dev_commands(self, ctx: commands.Context) -> None:
+        """
+        Dev commands for testing and building pickems
+        """
+        pass
+
+    @pickems_dev_commands.command(name="backup")
+    async def backup_pickems(self, ctx: commands.Context):
+        """
+        Backup Pickems
+        """
+        data = await self.pickems_config.all_guilds()
+        date_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+        save = cog_data_path(self).joinpath(f"Pickems-Backup-{date_str}.json")
+        with save.open("w") as outfile:
+            outfile.write(json.dumps(data))
+        await ctx.send(f"I have backed up pickems data to `{save}`.")
+
+    @pickems_dev_commands.command(name="resetweekly", with_app_command=False)
     async def reset_weekly_pickems_data(self, ctx: commands.Context) -> None:
         """
         Force reset all pickems data for the week
@@ -62,12 +208,12 @@ class HockeyDev(MixinMeta):
             guild = self.bot.get_guild(guild_id)
             if guild is None:
                 continue
-            if await self.pickems_config.guild(guild).pickems_category():
+            if await self.pickems_config.guild(guild).pickems_channel():
                 guilds_to_make_new_pickems.append(guild)
         await self.create_weekly_pickems_pages(guilds_to_make_new_pickems)
         await ctx.send("Finished resetting all pickems data.")
 
-    @hockeydev.command(name="pickemsannounce")
+    @pickems_dev_commands.command(name="announce", with_app_command=False)
     async def announce_pickems(self, ctx: commands.Context, *, message: str) -> None:
         """
         Announce a message in all setup pickems channels
@@ -90,8 +236,115 @@ class HockeyDev(MixinMeta):
                             pass
         await ctx.send(_("Message announced in pickems channels."))
 
-    @hockeydev.command()
-    async def getgoals(self, ctx: commands.Context) -> None:
+    @pickems_dev_commands.command(name="toggle")
+    async def pickems_dev_toggle(self, ctx: commands.Context):
+        """
+        Toggle the ability for users to setup pickems on their servers
+        """
+        allowed_only = not await self.pickems_config.only_allowed()
+        await self.pickems_config.only_allowed.set(allowed_only)
+        if allowed_only:
+            msg = _("Pickems will only be enabled for allowed guilds.")
+        else:
+            msg = _("Pickems will be enabled for everyone.")
+
+        await ctx.send(msg)
+
+    @pickems_dev_commands.command(name="msg")
+    async def pickems_dev_msg(self, ctx: commands.Context, *, msg: Optional[str] = None):
+        """
+        Set the message sent to users attempting to add pickems when it
+        is disabled.
+        """
+        if msg and len(msg) > 2000:
+            await ctx.send(_("Your message needs to be fewer than 2000 characters."))
+            return
+        await self.pickems_config.unavailable_msg.set(msg)
+        await ctx.send(_("Pickems Unavailable message set to:\n{msg}").format(msg=msg))
+
+    @commands.Cog.listener()
+    async def on_patreon_add_guild(self, guild_id: int):
+        """
+        A guild ID was added to patreon features
+        """
+        log.info("Adding Pickems to guild ID %s", guild_id)
+        async with self.pickems_config.allowed_guilds() as allowed:
+            if guild_id not in allowed:
+                allowed.append(guild_id)
+
+    @commands.Cog.listener()
+    async def on_patreon_removed_guild(self, guild_id: int):
+        """
+        A guild ID was removed from patreon features
+        """
+        log.info("Removing guild ID %s from pickems features", guild_id)
+        async with self.pickems_config.allowed_guilds() as allowed:
+            if guild_id in allowed:
+                allowed.remove(guild_id)
+        await self.pickems_config.guild_from_id(guild_id).pickems_channel.clear()
+        await self.pickems_config.guild_from_id(guild_id).pickems_category.clear()
+
+    @pickems_dev_commands.command(name="addguild")
+    async def pickems_add_guild(self, ctx: commands.Context, guild_id: int):
+        """
+        Add a guild to the pickems allowed guilds
+        """
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            await ctx.send(_("I am not currently in {guild_id}.").format(guild_id=guild_id))
+            return
+        async with self.pickems_config.allowed_guilds() as allowed:
+            if guild_id not in allowed:
+                allowed.append(guild_id)
+        await ctx.send(_("{guild} added to pickems allowed guilds.").format(guild=guild.name))
+
+    @pickems_dev_commands.command(name="remguild")
+    async def pickems_remove_guild(self, ctx: commands.Context, guild_id: int):
+        """
+        Remove a guild from the pickems allowed guilds
+        """
+        async with self.pickems_config.allowed_guilds() as allowed:
+            if guild_id in allowed:
+                allowed.remove(guild_id)
+        await self.pickems_config.guild_from_id(guild_id).pickems_channel.clear()
+        await self.pickems_config.guild_from_id(guild_id).pickems_category.clear()
+        await ctx.send(
+            _("Guild {guild_id} removed from the pickems allowed guilds.").format(
+                guild_id=guild_id
+            )
+        )
+
+    @pickems_dev_commands.command(name="fix")
+    async def fix_pickems_views(self, ctx: commands.Context):
+        """
+        For some reason reloading doesn't re-add the views to the bots persistent
+        views list. This command does that if for whatever reason after reloading
+        the cog the views are not registering votes.
+        """
+        for guild_id, pickems in self.all_pickems.items():
+            for name, pickem in pickems.items():
+                self.bot.add_view(pickem)
+        await ctx.send(_("Added all pickems views to the bot."))
+
+    @pickems_dev_commands.command(name="list")
+    async def list_pickems_guilds(self, ctx: commands.Context):
+        """
+        List all guilds allowed to have pickems
+        """
+        guild_ids = await self.pickems_config.allowed_guilds()
+        guilds = []
+        for guild_id in guild_ids:
+            g = self.bot.get_guild(guild_id)
+            if g is not None:
+                guilds.append(f"{g.id} - {g.name}")
+            else:
+                guilds.append(f"{guild_id}")
+        msg = "\n".join(g for g in guilds)
+        for page in pagify(msg):
+            await ctx.send(page)
+
+    @pickems_dev_commands.command(name="make", with_app_command=False)
+    async def make_fake_pickems(self, ctx: commands.Context) -> None:
         """
         Testing function with testgame.json
         """
@@ -100,89 +353,109 @@ class HockeyDev(MixinMeta):
         # log.debug(link)
         with open("/mnt/e/github/Trusty-cogs/hockey/testgame.json", "r") as infile:
             data = json.loads(infile.read())
-        # log.debug(data)
+        log.verbose("make_fake_pickems - testgame.json: %s", data)
         game = await Game.from_json(data)
-        await game.check_game_state(self.bot)
-        if (game.home_score + game.away_score) != 0:
-            await game.check_team_goals(self.bot)
-        all_teams = await self.config.teams()
-        for team in await self.config.teams():
-            if team["team_name"] in [game.home_team, game.away_team]:
-                all_teams.remove(team)
-                team["goal_id"] = {}
-                team["game_state"] = "Null"
-                team["game_start"] = ""
-                team["period"] = 0
-                all_teams.append(team)
+        fake_pickem = await self.get_pickem_object(ctx.guild, game)
+        msg = await self.make_pickems_msg(ctx.guild, game)
+        msg = await ctx.send(msg, view=fake_pickem)
+        fake_pickem.messages.append(f"{ctx.channel.id}-{msg.id}")
+        fake_pickem._should_save = True
 
-        await self.config.teams.set(all_teams)
-        await ctx.send("Done testing.")
+    @pickems_dev_commands.command(name="disable", with_app_command=False)
+    async def disable_fake_pickems(self, ctx: commands.Context) -> None:
+        """
+        Test final functions for pickems
+        """
+        with open("/mnt/e/github/Trusty-cogs/hockey/testgame.json", "r") as infile:
+            data = json.loads(infile.read())
+        log.verbose("disable_fake_pickems - testgame.json: %s", data)
+        game = await Game.from_json(data)
+        await self.disable_pickems_buttons(game)
 
-    @hockeydev.command(name="pickemstally")
+    @pickems_dev_commands.command(name="final", with_app_command=False)
+    async def finalize_fake_pickems(self, ctx: commands.Context) -> None:
+        """
+        Test a game final for pickems
+        """
+        with open("/mnt/e/github/Trusty-cogs/hockey/testgame.json", "r") as infile:
+            data = json.loads(infile.read())
+        log.verbose("finalize_fake_pickems - testgame.json: %s", data)
+        game = await Game.from_json(data)
+        await self.set_guild_pickem_winner(game)
+
+    @pickems_dev_commands.command(name="tally", with_app_command=False)
     async def pickems_tally(self, ctx: commands.Context) -> None:
         """
         Manually tally the leaderboard for all servers
         """
-        try:
-            await self.tally_leaderboard()
-        except Exception:
-            log.exception("Error manually tallying pickems Leaderboard.")
-            return await ctx.send(
-                _("There was an error tallying pickems leaerboard. Check the console fore errors.")
-            )
+        async with ctx.typing():
+            try:
+                await self.tally_leaderboard()
+            except Exception:
+                log.exception("Error manually tallying pickems Leaderboard.")
+                await ctx.send(
+                    _(
+                        "There was an error tallying pickems leaerboard. Check the console fore errors."
+                    )
+                )
+                return
         await ctx.send(_("Leaderboard tallying complete."))
 
-    @hockeydev.command(name="removeoldpickems")
+    @pickems_dev_commands.command(name="removeold", with_app_command=False)
     async def remove_old_pickems(
         self, ctx: commands.Context, year: int, month: int, day: int
     ) -> None:
         """
         Remove pickems objects created before a specified date.
         """
-        start = date(year, month, day)
-        good_list = {}
-        for guild_id in await self.pickems_config.all_guilds():
-            g = self.bot.get_guild(guild_id)
-            pickems = [Pickems.from_json(p) for p in await self.pickems_config.guild(g).pickems()]
-            for p in pickems:
-                if p.game_start > start:
-                    good_list[p.name] = p.to_json()
-            await self.pickems_config.guild(g).pickems.set(good_list)
+        async with ctx.typing():
+            start = date(year, month, day)
+            good_list = {}
+            for guild_id in await self.pickems_config.all_guilds():
+                g = self.bot.get_guild(guild_id)
+                pickems = [
+                    Pickems.from_json(p) for p in await self.pickems_config.guild(g).pickems()
+                ]
+                for p in pickems:
+                    if p.game_start > start:
+                        good_list[p.name] = p.to_json()
+                await self.pickems_config.guild(g).pickems.set(good_list)
         await ctx.send(_("All old pickems objects deleted."))
 
-    @hockeydev.command(name="checkpickemswinner")
+    @pickems_dev_commands.command(name="checkwinner", with_app_command=False)
     async def check_pickem_winner(self, ctx: commands.Context, days: int = 1) -> None:
         """
         Manually check all pickems objects for winners
 
         `days` number of days to look back
         """
-        days = days + 1
-        now = datetime.now()
-        for i in range(1, days):
-            delta = timedelta(days=-i)
-            check_day = now + delta
-            games = await Game.get_games(None, check_day, check_day)
-            for game in games:
-                await self.set_guild_pickem_winner(game)
+        async with ctx.typing():
+            days = days + 1
+            now = datetime.now(timezone.utc)
+            for i in range(1, days):
+                delta = timedelta(days=-i)
+                check_day = now + delta
+                games = await Game.get_games(None, check_day, check_day)
+                for game in games:
+                    await self.set_guild_pickem_winner(game)
         await ctx.send(_("Pickems winners set."))
 
-    @hockeydev.command(name="fixallpickems")
+    @pickems_dev_commands.command(name="fixall", with_app_command=False)
     async def fix_all_pickems(self, ctx: commands.Context) -> None:
         """
         Fixes winner on all current pickems objects if possible
         """
-        oldest = datetime.now()
+        oldest = datetime.now(timezone.utc)
         for guild_id, pickems in self.all_pickems.items():
             for name, p in pickems.items():
                 if p.game_start < oldest:
                     oldest = p.game_start
-        games = await Game.get_games(None, oldest, datetime.now())
+        games = await Game.get_games(None, oldest, datetime.now(timezone.utc))
         for game in games:
             await self.set_guild_pickem_winner(game)
         await ctx.send(_("All pickems winners set."))
 
-    @hockeydev.command()
+    @hockeydev.command(with_app_command=False)
     async def teststandings(self, ctx: commands.Context) -> None:
         """
         Test the automatic standings function/manually update standings
@@ -194,7 +467,7 @@ class HockeyDev(MixinMeta):
                 log.debug("error testing standings page", exc_info=True)
         await ctx.send(_("Finished fixing all standings messages."))
 
-    @hockeydev.command()
+    @hockeydev.command(with_app_command=False)
     @commands.bot_has_permissions(embed_links=True)
     async def cogstats(self, ctx: commands.Context) -> None:
         """
@@ -305,61 +578,126 @@ class HockeyDev(MixinMeta):
             timeout=60,
         ).start(ctx=ctx)
 
-    @hockeydev.command()
-    async def customemoji(self, ctx: commands.Context) -> None:
+    @hockeydev.command(with_app_command=False)
+    async def getlogos(self, ctx: commands.Context, make_emoji: bool = True) -> None:
         """
-        Set custom emojis for the bot to use
+        Download all of the team's latest logos and upload them as custom emojis for
+        the bot to use.
+        """
+        if not CAIRO:
+            await ctx.send(
+                "Either `cairosvg` or `pillow` is not installed so I can't download team logos."
+            )
+            return
+        async with ctx.typing():
+            session = aiohttp.ClientSession(
+                headers={"User-Agent": "Red-DiscordBot Trusty-cogs Hockey"}
+            )
+            existing = await self.bot.fetch_application_emojis()
+            log.debug(existing)
+            teams = await self.api.stats_api.team_logos()
+            logos_path = cog_data_path(self).joinpath("teamlogos")
+            logos_path.mkdir(exist_ok=True)
+            added = set()
+            changed_logos = set()
 
-        Requires you to upload a .yaml file with
-        emojis that the bot can see
-        an example may be found
-        [here](https://github.com/TrustyJAID/Trusty-cogs/blob/master/hockey/emoji.yaml)
-        if no emoji is provided for a team the Other
-        slot will be filled instead
-        It's recommended to have an emoji for every team
-        to utilize all features of the cog such as pickems
-        """
-        attachments = ctx.message.attachments
-        if attachments == []:
-            await ctx.send(_("Upload the .yaml file to use. Type `exit` to cancel."))
-            msg = await self.wait_for_file(ctx)
-            if msg is None:
-                return
-            try:
-                await self.change_custom_emojis(msg.attachments)
-            except InvalidFileError:
-                await ctx.send(_("That file doesn't seem to be formatted correctly."))
-                return
+            for team in teams.get("data", []):
+                name = team["fullName"]
+                # idx = 0
+                static_info = TEAMS.get(name, None)
+                if static_info is None:
+                    # ignore teams I haven't accounted for yet
+                    log.debug("Found an NHL Team not registered in the API: %s", name)
+                    continue
+                secondary = static_info.get("secondary", False)
+                background = static_info.get("background", "dark")
+                end_season = None
+                for logo in sorted(
+                    team.get("logos", []), key=lambda x: x.get("endSeason", 0), reverse=True
+                ):
+                    if end_season is None:
+                        end_season = logo.get("endSeason", -1)
+                    else:
+                        if end_season > logo.get("endSeason", -1):
+                            continue
+                    if name in added:
+                        continue
+                    bg = logo.get("background", "")
+                    if bg != background:
+                        continue
+                    secure_url = logo.get("secureUrl")
+                    if secure_url is None:
+                        continue
+                    if secondary:
+                        secure_url = secure_url.replace(
+                            f"{background}.svg", f"secondary_{background}.svg"
+                        )
+                        async with session.get(secure_url) as resp:
+                            if resp.status != 200:
+                                log.error(
+                                    "There was an error downloading the secondary logo for %s: %s",
+                                    name,
+                                    resp.status,
+                                )
+                                continue
+                            data = await resp.read()
+                    async with session.get(secure_url) as resp:
+                        if resp.status != 200:
+                            log.error(
+                                "There was an error downloading the logo for %s: %s",
+                                name,
+                                resp.status,
+                            )
+                            continue
+                        data = await resp.read()
+                    team_logo = TeamLogo(data, name, background, logos_path)
+                    if await team_logo.check():
+                        changed_logos.add(name)
+
+                    if make_emoji and team_logo.emoji is not None:
+                        to_del = discord.utils.find(
+                            lambda e: e.name == team_logo.filename, existing
+                        )
+                        if to_del:
+                            log.debug("Deleting %r", to_del)
+                            try:
+                                await to_del.delete()
+                            except Exception:
+                                log.exception("Error deleting old emoji")
+                        try:
+                            await self.bot.create_application_emoji(
+                                name=team_logo.filename, image=team_logo.emoji.read()
+                            )
+                        except Exception:
+                            log.exception("Error creating application emoji.")
+                        added.add(name)
+
+            await session.close()
+            await self.load_bot_emojis()
+        if added:
+            await ctx.send(
+                "I have uploaded the following team emojis: {teams}".format(
+                    teams=humanize_list(list(added))
+                )
+            )
+        elif changed_logos:
+            await ctx.send(
+                "The following team logos have changed since I last downloaded them: {teams}".format(
+                    teams=humanize_list(list(changed_logos))
+                )
+            )
         else:
-            try:
-                await self.change_custom_emojis(attachments)
-            except InvalidFileError:
-                await ctx.send(_("That file doesn't seem to be formatted correctly."))
-                return
-        new_msg = "".join(("<:" + TEAMS[e]["emoji"] + ">") for e in TEAMS)
-        msg = _("New emojis set to: ") + new_msg
-        for page in pagify(msg):
-            await ctx.send(page)
-        await ctx.send("You should reload the cog for everything to work correctly.")
+            await ctx.send("None of the logos have changed since I last downloaded team logos.")
 
-    @hockeydev.command()
+    @hockeydev.command(with_app_command=False)
     async def resetgames(self, ctx: commands.Context) -> None:
         """
         Resets the bots game data incase something goes wrong
         """
-        all_teams = await self.config.teams()
-        for team in await self.config.teams():
-            all_teams.remove(team)
-            team["goal_id"] = {}
-            team["game_state"] = "Null"
-            team["game_start"] = ""
-            team["period"] = 0
-            all_teams.append(team)
-
-        await self.config.teams.set(all_teams)
+        await self.config.teams.clear()
         await ctx.send(_("Saved game data reset."))
 
-    @hockeydev.command()
+    @hockeydev.command(with_app_command=False)
     async def setcreated(self, ctx: commands.Context, created: bool) -> None:
         """
         Sets whether or not the game day channels have been created
@@ -367,7 +705,7 @@ class HockeyDev(MixinMeta):
         await self.config.created_gdc.set(created)
         await ctx.send(_("created_gdc set to ") + str(created))
 
-    @hockeydev.command()
+    @hockeydev.command(with_app_command=False)
     async def cleargdc(self, ctx: commands.Context) -> None:
         """
         Checks for manually deleted channels from the GDC channel list
@@ -375,75 +713,19 @@ class HockeyDev(MixinMeta):
         """
         guild = ctx.message.guild
         good_channels = []
-        for channel_id in await self.config.guild(guild).gdc():
+        gdc_chans = await self.config.guild(guild).gdc_chans()
+        for channel_id in gdc_chans.values():
             channel = guild.get_channel(channel_id)
             if channel is None:
                 await self.config.channel_from_id(channel_id).clear()
-                log.info(f"Removed the following channels {channel_id}")
+                log.info("Removed the following channels %s", channel_id)
                 continue
             else:
                 good_channels.append(channel.id)
         await self.config.guild(guild).gdc.set(good_channels)
         await ctx.tick()
 
-    @hockeydev.command(name="clearbrokenchannels")
-    async def clear_broken_channels(self, ctx: commands.Context) -> None:
-        """
-        Removes missing channels from the config
-        """
-        all_channels = await self.config.all_channels()
-        for channel_id, data in all_channels.items():
-            if not data["guild_id"]:
-                channel = self.bot.get_channel(channel_id)
-                guild = channel.guild
-                await self.config.channel(channel).guild_id.set(guild.id)
-            else:
-                guild = self.bot.get_guild(data["guild_id"])
-                if not guild:
-                    await self.config.channel_from_id(channel_id).clear()
-                    await self.config.guild_from_id(data["guild_id"]).clear()
-                    log.info(f"Removed the following channels {channel_id}")
-                    continue
-                channel = guild.get_channel
-
-            if channel is None:
-                await self.config.channel_from_id(channel_id).clear()
-                log.info(f"Removed the following channels {channel_id}")
-                continue
-            # if await self.config.channel(channel).to_delete():
-            # await self.config._clear_scope(Config.CHANNEL, str(channels))
-        await ctx.send(_("Broken channels removed"))
-
-    @hockeydev.command()
-    async def remove_broken_guild(self, ctx: commands.Context) -> None:
-        """
-        Removes a server that no longer exists on the bot
-        """
-        # all_guilds = await self.config.all_guilds()
-        for guild_id in await self.config.all_guilds():
-            guild = self.bot.get_guild(guild_id)
-            if guild is None:
-                await self.config.guild_from_id(guild_id).clear()
-            else:
-                if not await self.config.guild(guild).create_channels():
-                    await self.config.guild(guild).gdc.clear()
-
-        await ctx.send(_("Saved servers the bot is no longer on have been removed."))
-
-    @hockeydev.command(hidden=True)
-    async def lights(self, ctx: commands.Context) -> None:
-        """
-        Tests the philips Hue light integration
-        This is hard coded at the moment with no plans to make work generally
-        this will be safely ignored.
-        """
-        if LIGHTS_SET:
-            hue = Oilers(self.bot)
-            hue.goal_lights()
-            print("done")
-        await ctx.tick()
-
-    @hockeydev.command(hidden=True)
+    @hockeydev.command(hidden=True, with_app_command=False)
     async def testloop(self, ctx: commands.Context) -> None:
         """
         Toggle the test game loop
@@ -451,11 +733,11 @@ class HockeyDev(MixinMeta):
         self.TEST_LOOP = not self.TEST_LOOP
         await ctx.send(_("Test loop set to ") + str(self.TEST_LOOP))
 
-    @hockeydev.command()
+    @hockeydev.command(with_app_command=False)
     async def clear_seasonal_leaderboard_all(self, ctx: commands.Context) -> None:
         """
         Clears the bots seasonal pickems leaderboard
         """
         for guild_id in await self.pickems_config.all_guilds():
-            await self.config.guild_from_id(guild_id).leaderboard.clear()
+            await self.pickems_config.guild_from_id(int(guild_id)).leaderboard.clear()
         await ctx.send(_("Seasonal pickems leaderboards cleared."))
